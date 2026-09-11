@@ -1,0 +1,67 @@
+# Provider-neutral sandboxed NOOA config. Include one sandbox provider config,
+# for example nemo_gym/sandbox/providers/docker/configs/docker.yaml, alongside
+# this file when starting an environment.
+nooa_sandboxed_agent:
+  responses_api_agents:
+    nooa_sandboxed_agent:
+      entrypoint: app.py
+      domain: agent
+      description: Run a configured NVIDIA OO Agent entirely inside a Gym task sandbox.
+      value: Evaluate or train custom NOOA orchestration while isolating generated code from the Agent server.
+      num_workers: 4
+      resources_server:
+        type: resources_servers
+        name: ???
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      token_id_capture: true
+
+      # Named block supplied by the selected provider config.
+      sandbox_provider: sandbox
+      sandbox_spec:
+        image: nemo-gym-nooa:latest
+        ttl_s: 2700
+        ready_timeout_s: 1200
+        resources:
+          cpu: 1
+          memory_mib: 2048
+          disk_gib: 30
+        provider_options: {}
+        metadata:
+          harness: nooa
+
+      # Override these when the provider cannot reach Gym's configured hostnames
+      # (for example, Docker commonly uses http://host.docker.internal:<port>).
+      sandbox_model_base_url: null
+      # Per-server overrides take precedence and also cover agent.model_aliases.
+      sandbox_model_base_urls: {}
+      sandbox_resources_base_url: null
+
+      runtime:
+        # "baked" expects the image to contain NOOA at /opt/nooa/bin/python.
+        # "archive" uploads and extracts a portable virtual environment per sandbox.
+        source: baked
+        archive_path: null
+        python: /opt/nooa/bin/python
+        extract_dir: /tmp/nemo-gym-nooa-runtime
+
+      agent:
+        agent_class: ???
+        entrypoint: run
+        init_kwargs: {}
+        arguments:
+          task:
+            source: responses_create_params.input
+            transform: latest_user_text
+        tool_namespace: resources
+        allowed_tools: []
+        model_aliases: {}
+        source_archive: null
+        pythonpath: []
+
+      max_model_calls: 10
+      timeout_s: 2100
+      concurrency: 8
+      max_artifact_bytes: 67108864
+      datasets: []
