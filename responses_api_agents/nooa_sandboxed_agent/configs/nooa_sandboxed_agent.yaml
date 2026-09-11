@@ -6,7 +6,7 @@ nooa_sandboxed_agent:
     nooa_sandboxed_agent:
       entrypoint: app.py
       domain: agent
-      description: Run a configured NVIDIA OO Agent entirely inside a Gym task sandbox.
+      description: Run a configured NOOA agent entirely inside a Gym task sandbox.
       value: Evaluate or train custom NOOA orchestration while isolating generated code from the Agent server.
       num_workers: 4
       resources_server:

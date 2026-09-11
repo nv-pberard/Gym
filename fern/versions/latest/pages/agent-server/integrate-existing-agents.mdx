@@ -10,7 +10,7 @@ You can use an existing agent in NeMo Gym, integrate an external one, or build y
 
 ## Run a NOOA Agent in a Sandbox
 
-Use `nooa_sandboxed_agent` when a [NVIDIA-labs OO Agents](https://github.com/NVIDIA-NeMo/labs-OO-Agents) (NOOA) agent can execute generated Python or should otherwise be isolated from the Agent server process. The host process only orchestrates lifecycle and verification. It uploads a request and runner, and all NOOA imports, generated code, model calls, and resource-tool calls happen in the task sandbox.
+Use `nooa_sandboxed_agent` when a [NOOA](https://github.com/NVIDIA-NeMo/labs-OO-Agents) agent can execute generated Python or should otherwise be isolated from the Agent server process. The host process only orchestrates lifecycle and verification. It uploads a request and runner, and all NOOA imports, generated code, model calls, and resource-tool calls happen in the task sandbox.
 
 Start from `responses_api_agents/nooa_sandboxed_agent/configs/nooa_sandboxed_agent.yaml` and configure:
 
