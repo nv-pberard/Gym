@@ -11,6 +11,7 @@ nooa_sandboxed_agent:
       num_workers: 4
       resources_server:
         type: resources_servers
+        # Required: set this to the Resources server that owns task state and verification.
         name: ???
       model_server:
         type: responses_api_models
@@ -47,6 +48,7 @@ nooa_sandboxed_agent:
         extract_dir: /tmp/nemo-gym-nooa-runtime
 
       agent:
+        # Required: sandbox-importable NOOA class in module.path:ClassName form.
         agent_class: ???
         entrypoint: run
         init_kwargs: {}
