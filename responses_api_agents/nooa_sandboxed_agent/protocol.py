@@ -43,6 +43,7 @@ class NOOASandboxRequest(StrictModel):
     model_aliases: dict[str, NOOAModelEndpoint] = Field(default_factory=dict)
     mcp: NOOAMCPConfig | None = None
     max_model_calls: int = Field(default=10, gt=0)
+    expected_nooa_version: str | None = None
     response_defaults: dict[str, Any] = Field(default_factory=dict)
     artifacts_dir: str
 
@@ -100,6 +101,7 @@ class NOOASandboxResult(StrictModel):
     tool_calls: list[NOOAToolArtifact] = Field(default_factory=list)
     invocations: list[NOOAInvocationArtifact] = Field(default_factory=list)
     observation_gaps: list[str] = Field(default_factory=list)
+    runtime: dict[str, Any] = Field(default_factory=dict)
 
 
 class NOOAEvent(StrictModel):

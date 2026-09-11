@@ -109,12 +109,23 @@ class NOOARuntimeConfig(BaseModel):
     archive_path: str | None = None
     python: str = "/opt/nooa/bin/python"
     extract_dir: str = "/tmp/nemo-gym-nooa-runtime"
+    workdir: str | None = None
+    expected_nooa_version: str | None = "0.0.10"
 
-    @field_validator("python", "extract_dir")
+    @field_validator("python", "extract_dir", "workdir")
     @classmethod
-    def validate_absolute_sandbox_path(cls, value: str) -> str:
+    def validate_absolute_sandbox_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
         if not value.startswith("/") or value in {"/", "/tmp"}:
             raise ValueError("sandbox runtime paths must be absolute, non-root paths")
+        return value
+
+    @field_validator("expected_nooa_version")
+    @classmethod
+    def validate_expected_nooa_version(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("runtime.expected_nooa_version must be non-empty or null")
         return value
 
     @model_validator(mode="after")
@@ -134,9 +145,11 @@ class NOOASandboxedAgentConfig(BaseResponsesAPIAgentConfig):
     sandbox_model_base_url: str | None = None
     sandbox_model_base_urls: dict[str, str] = Field(default_factory=dict)
     sandbox_resources_base_url: str | None = None
+    seed_session_overrides: dict[str, Any] = Field(default_factory=lambda: {"create_pty": False})
     runtime: NOOARuntimeConfig = Field(default_factory=NOOARuntimeConfig)
     agent: NOOAAgentSpec
     max_model_calls: int = Field(default=10, gt=0)
     timeout_s: float = Field(default=2100, gt=0)
     concurrency: int = Field(default=8, gt=0)
     max_artifact_bytes: int = Field(default=64 * 1024 * 1024, gt=0)
+    results_dir: str | None = "responses_api_agents/nooa_sandboxed_agent/results"

@@ -117,7 +117,7 @@ def project_result(
                 )
             )
             gaps.append(ObservationGap(code="non_trainable_terminal_output"))
-    if not output:
+    if not output and result.status == "completed":
         output.append(
             NeMoGymResponseOutputMessage(
                 id=f"msg_nooa_empty_{uuid4().hex}",

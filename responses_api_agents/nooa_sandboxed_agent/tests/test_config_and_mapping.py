@@ -34,6 +34,10 @@ def test_materialize_arguments_only_reads_explicit_safe_paths() -> None:
     with pytest.raises(ValidationError, match="verifier field"):
         NOOAArgumentBinding(source="verifier_metadata.answer")
 
+    for source in ("patch", "test_patch", "expected_answer", "reference_answer", "gold"):
+        with pytest.raises(ValidationError, match="verifier field"):
+            NOOAArgumentBinding(source=source)
+
 
 def test_latest_user_text_uses_last_user_message() -> None:
     assert (
@@ -69,3 +73,11 @@ def test_agent_spec_rejects_unsafe_names_and_reserved_llm() -> None:
 def test_archive_runtime_requires_archive_path() -> None:
     with pytest.raises(ValidationError, match="archive_path is required"):
         NOOARuntimeConfig(source="archive")
+
+
+def test_runtime_workdir_must_be_an_absolute_non_root_path() -> None:
+    assert NOOARuntimeConfig(workdir="/app").workdir == "/app"
+    with pytest.raises(ValidationError, match="absolute, non-root"):
+        NOOARuntimeConfig(workdir="app")
+    with pytest.raises(ValidationError, match="non-empty or null"):
+        NOOARuntimeConfig(expected_nooa_version="")

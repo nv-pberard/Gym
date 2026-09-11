@@ -39,6 +39,11 @@ nooa_sandboxed_agent:
       sandbox_model_base_urls: {}
       sandbox_resources_base_url: null
 
+      # Extra fields sent only to /seed_session. The sandboxed runner does not
+      # use an interactive terminal, so compatible Resources servers can skip it.
+      seed_session_overrides:
+        create_pty: false
+
       runtime:
         # "baked" expects the image to contain NOOA at /opt/nooa/bin/python.
         # "archive" uploads and extracts a portable virtual environment per sandbox.
@@ -46,6 +51,9 @@ nooa_sandboxed_agent:
         archive_path: null
         python: /opt/nooa/bin/python
         extract_dir: /tmp/nemo-gym-nooa-runtime
+        # Null preserves the sandbox provider's configured working directory.
+        workdir: null
+        expected_nooa_version: 0.0.10
 
       agent:
         # Required: sandbox-importable NOOA class in module.path:ClassName form.
@@ -66,4 +74,5 @@ nooa_sandboxed_agent:
       timeout_s: 2100
       concurrency: 8
       max_artifact_bytes: 67108864
+      results_dir: responses_api_agents/nooa_sandboxed_agent/results
       datasets: []

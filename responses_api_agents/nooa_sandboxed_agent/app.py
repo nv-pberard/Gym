@@ -65,9 +65,17 @@ class NOOASandboxedVerifyRequest(BaseVerifyRequest):
 class NOOASandboxedVerifyResponse(BaseVerifyResponse):
     model_config = ConfigDict(extra="allow")
 
+    reward: float | None = Field(default=None, exclude_if=lambda value: value is None)
+    response: NeMoGymResponse | None = Field(default=None, exclude_if=lambda value: value is None)
     nooa_status: str
+    nooa_finished: bool
+    nooa_results_path: str | None = None
     nooa_run_stdout: str = ""
     nooa_run_stderr: str = ""
+    score_valid: bool
+    verifier_reward: float | None = None
+    failure_kind: str | None = None
+    mask_sample: bool = False
     ng_agent_observations: AgentObservationBundle | None = Field(default=None)
     ng_trajectory: TrajectoryRecord | None = Field(default=None)
 
@@ -112,6 +120,19 @@ def _sandbox_outcome(execution: SandboxExecution) -> str:
     if "result_artifact_unavailable" in execution.result.observation_gaps:
         return "sandbox_error"
     return "failed"
+
+
+def _is_scored(row: Mapping[str, Any]) -> bool:
+    reward = row.get("reward")
+    return (
+        not row.get("_ng_failure_class")
+        and row.get("score_valid") is not False
+        and row.get("mask_sample") is not True
+        and row.get("nooa_finished") is not False
+        and row.get("nooa_status") in {None, "completed"}
+        and isinstance(reward, (int, float))
+        and not isinstance(reward, bool)
+    )
 
 
 class NOOASandboxedAgent(SimpleResponsesAPIAgent):
@@ -173,6 +194,27 @@ class NOOASandboxedAgent(SimpleResponsesAPIAgent):
             allowed_tools=sorted(allowed),
         )
 
+    async def _cleanup_resources_session(self, cleanup_url_path: str | None, cookies: dict[str, str]) -> None:
+        if not cleanup_url_path:
+            return
+        try:
+            cleanup_response = await self.server_client.post(
+                server_name=self.config.resources_server.name,
+                url_path=cleanup_url_path,
+                json={},
+                cookies=cookies,
+            )
+            await raise_for_status(cleanup_response)
+        except Exception:
+            LOG.exception("Failed to clean up NOOA Resources-server session")
+
+    async def _release(self, acquired: AcquiredSandbox, cookies: dict[str, str]) -> None:
+        await self._cleanup_resources_session(acquired.cleanup_url_path, cookies)
+        try:
+            await release_sandbox(acquired)
+        except Exception:
+            LOG.exception("Failed to release NOOA sandbox %s", acquired.sandbox.sandbox_id)
+
     def _sandbox_request(
         self,
         body: NOOASandboxedRunRequest,
@@ -202,6 +244,7 @@ class NOOASandboxedAgent(SimpleResponsesAPIAgent):
             model_aliases=aliases,
             mcp=self._mcp_config(seed_response, params),
             max_model_calls=self.config.max_model_calls,
+            expected_nooa_version=self.config.runtime.expected_nooa_version,
             response_defaults=defaults,
             artifacts_dir="/tmp/nemo-gym-nooa/artifacts",
         )
@@ -217,7 +260,7 @@ class NOOASandboxedAgent(SimpleResponsesAPIAgent):
         seed_response = await self.server_client.post(
             server_name=self.config.resources_server.name,
             url_path="/seed_session",
-            json=body.model_dump(mode="json"),
+            json=body.model_dump(mode="json") | self.config.seed_session_overrides,
             cookies=cookies,
         )
         await raise_for_status(seed_response)
@@ -226,12 +269,18 @@ class NOOASandboxedAgent(SimpleResponsesAPIAgent):
 
         provider = resolve_provider_config(self.config.sandbox_provider, self.server_client.global_config_dict)
         metadata = resolve_provider_metadata(self.config.sandbox_provider, self.server_client.global_config_dict)
-        acquired = await acquire_sandbox(
-            self.config,
-            seed_response=seed_json,
-            resolved_provider=provider,
-            default_metadata=metadata,
-        )
+        try:
+            acquired = await acquire_sandbox(
+                self.config,
+                seed_response=seed_json,
+                resolved_provider=provider,
+                default_metadata=metadata,
+            )
+        except BaseException:
+            cleanup_url_path = seed_json.get("cleanup_url_path")
+            if isinstance(cleanup_url_path, str) and cleanup_url_path.startswith("/"):
+                await self._cleanup_resources_session(cleanup_url_path, cookies)
+            raise
         try:
             rollout_id = maybe_rollout_id_from_run_body(body) or uuid4().hex
             task_id = _task_id(body)
@@ -258,10 +307,7 @@ class NOOASandboxedAgent(SimpleResponsesAPIAgent):
             )
             return response, observations, trajectory, execution, acquired, cookies
         except BaseException:
-            try:
-                await release_sandbox(acquired)
-            except Exception:
-                LOG.exception("Failed to release NOOA sandbox after an execution error")
+            await self._release(acquired, cookies)
             raise
 
     async def responses(
@@ -281,7 +327,7 @@ class NOOASandboxedAgent(SimpleResponsesAPIAgent):
                     response.set_cookie(key, value)
                 return agent_response
             finally:
-                await release_sandbox(acquired)
+                await self._release(acquired, cookies)
 
     async def run(self, request: Request, body: NOOASandboxedRunRequest) -> NOOASandboxedVerifyResponse:
         async with self._semaphore:
@@ -310,6 +356,41 @@ class NOOASandboxedAgent(SimpleResponsesAPIAgent):
                     await raise_for_status(verify_response)
                     result = await get_response_json(verify_response)
 
+                nooa_finished = (
+                    execution.result.status == "completed"
+                    and agent_response.status == "completed"
+                    and execution.return_code == 0
+                    and execution.error_type is None
+                )
+                failure_kind = None
+                failure_reason = None
+                if not nooa_finished:
+                    failure_kind = "harness_incomplete" if execution.result.status == "cancelled" else "harness_error"
+                    failure_reason = (
+                        execution.result.error
+                        or execution.error_type
+                        or f"NOOA response status: {agent_response.status}; return code: {execution.return_code}"
+                    )
+                elif result.get("evaluation_completed") is False:
+                    failure_kind = "verification_error"
+                    failure_reason = result.get("error") or "Verification did not complete"
+
+                if failure_kind is not None:
+                    verifier_reward = result.get("reward")
+                    result.update(
+                        reward=None,
+                        response=None,
+                        verifier_reward=verifier_reward if isinstance(verifier_reward, (int, float)) else None,
+                        score_valid=False,
+                        failure_kind=failure_kind,
+                        failure_reason=failure_reason,
+                        mask_sample=True,
+                        _ng_failure_class="agent_run_error",
+                        _ng_failure_message=failure_reason,
+                    )
+                else:
+                    result.update(score_valid=True, mask_sample=False)
+
                 resolved = result.get("resolved")
                 if isinstance(resolved, bool) and trajectory.turns:
                     trajectory.turns[-1].resolved = resolved
@@ -322,6 +403,8 @@ class NOOASandboxedAgent(SimpleResponsesAPIAgent):
                     )
                 result |= {
                     "nooa_status": execution.result.status,
+                    "nooa_finished": nooa_finished,
+                    "nooa_results_path": execution.artifacts_path,
                     "nooa_run_stdout": execution.stdout,
                     "nooa_run_stderr": execution.stderr,
                     "ng_agent_observations": observations.model_dump(mode="json"),
@@ -329,21 +412,29 @@ class NOOASandboxedAgent(SimpleResponsesAPIAgent):
                 }
                 return NOOASandboxedVerifyResponse.model_validate(result)
             finally:
-                try:
-                    await release_sandbox(acquired)
-                except Exception:
-                    LOG.exception("Failed to release NOOA sandbox %s", acquired.sandbox.sandbox_id)
+                await self._release(acquired, cookies)
 
     async def aggregate_metrics(self, body: AggregateMetricsRequest = Body()) -> AggregateMetrics:
         if self.config.skip_verification:
             return await super().aggregate_metrics(body)
+        scored = [row for row in body.verify_responses if _is_scored(row)]
         response = await self.server_client.post(
             server_name=self.config.resources_server.name,
             url_path="/aggregate_metrics",
-            json=body,
+            json=body.model_copy(update={"verify_responses": scored}),
         )
         await raise_for_status(response)
-        return AggregateMetrics.model_validate(await get_response_json(response))
+        metrics = AggregateMetrics.model_validate(await get_response_json(response))
+        attempted = len(body.verify_responses)
+        metrics.agent_metrics.update(
+            {
+                "nooa/attempted": attempted,
+                "nooa/scored": len(scored),
+                "nooa/excluded": attempted - len(scored),
+                "nooa/coverage": len(scored) / attempted if attempted else 0.0,
+            }
+        )
+        return metrics
 
 
 if __name__ == "__main__":

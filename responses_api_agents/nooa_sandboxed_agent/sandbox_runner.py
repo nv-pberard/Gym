@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import importlib
+import importlib.metadata
 import inspect
 import json
 import os
@@ -732,21 +733,6 @@ async def run(request_path: Path) -> int:
     # client. Keep that import offline and route actual inference through aiohttp.
     os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
     import aiohttp
-    from nooa import Agent
-    from nooa.runtime import hooks as nooa_hooks  # type: ignore[import-untyped]
-
-    try:
-        hooks_scope = nooa_hooks.hooks_scope
-    except AttributeError:
-
-        @contextmanager
-        def hooks_scope(hooks: Any) -> Any:
-            previous = nooa_hooks.get_hooks()
-            nooa_hooks.set_hooks(hooks)
-            try:
-                yield hooks
-            finally:
-                nooa_hooks.set_hooks(previous)
 
     request = json.loads(request_path.read_text(encoding="utf-8"))
     request_path.unlink(missing_ok=True)
@@ -763,10 +749,43 @@ async def run(request_path: Path) -> int:
         "tool_calls": [],
         "invocations": [],
         "observation_gaps": [],
+        "runtime": {
+            "python": sys.version,
+            "cwd": os.getcwd(),
+            "agent_class": request.get("agent_class"),
+        },
     }
 
     timeout = aiohttp.ClientTimeout(total=None, connect=60, sock_read=900)
     try:
+        import nooa
+        from nooa import Agent
+        from nooa.runtime import hooks as nooa_hooks  # type: ignore[import-untyped]
+
+        nooa_version = importlib.metadata.version("nooa")
+        result["runtime"].update(
+            {
+                "nooa_version": nooa_version,
+                "nooa_path": str(Path(nooa.__file__).resolve()) if nooa.__file__ else None,
+            }
+        )
+        expected_version = request.get("expected_nooa_version")
+        if expected_version is not None and nooa_version != expected_version:
+            raise RuntimeError(f"NOOA runtime version {nooa_version!r} does not match expected {expected_version!r}")
+
+        try:
+            hooks_scope = nooa_hooks.hooks_scope
+        except AttributeError:
+
+            @contextmanager
+            def hooks_scope(hooks: Any) -> Any:
+                previous = nooa_hooks.get_hooks()
+                nooa_hooks.set_hooks(hooks)
+                try:
+                    yield hooks
+                finally:
+                    nooa_hooks.set_hooks(previous)
+
         async with aiohttp.ClientSession(timeout=timeout) as session:
             llm_class = _make_llm_class()
             budget = RolloutBudget(int(request["max_model_calls"]))
@@ -790,6 +809,7 @@ async def run(request_path: Path) -> int:
 
             module_name, _, class_name = request["agent_class"].partition(":")
             module = importlib.import_module(module_name)
+            result["runtime"]["agent_module_path"] = str(Path(module.__file__).resolve()) if module.__file__ else None
             configured_class = getattr(module, class_name)
             if not inspect.isclass(configured_class) or not issubclass(configured_class, Agent):
                 raise TypeError(f"{request['agent_class']!r} is not a nooa.Agent subclass")

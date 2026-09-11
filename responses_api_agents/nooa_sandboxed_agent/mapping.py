@@ -19,10 +19,15 @@ Transform = Callable[[Any], Any]
 _FORBIDDEN_ROOTS = frozenset(
     {
         "agent_ref",
+        "expected_answer",
+        "gold",
         "ng_agent_observations",
         "ng_trajectory",
+        "patch",
+        "reference_answer",
         "response",
         "reward",
+        "test_patch",
         "verifier_metadata",
     }
 )

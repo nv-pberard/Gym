@@ -5,24 +5,23 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import shlex
 import tempfile
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from nemo_gym.sandbox import AsyncSandbox, SandboxResources, SandboxSpec, create_provider
 from responses_api_agents.nooa_sandboxed_agent.config import NOOASandboxedAgentConfig
 from responses_api_agents.nooa_sandboxed_agent.protocol import NOOASandboxRequest, NOOASandboxResult
 
 
-REMOTE_ROOT = "/tmp/nemo-gym-nooa"
-REMOTE_REQUEST = f"{REMOTE_ROOT}/request.json"
-REMOTE_RUNNER = f"{REMOTE_ROOT}/sandbox_runner.py"
-REMOTE_ARTIFACTS = f"{REMOTE_ROOT}/artifacts"
-REMOTE_AGENT_SOURCE = f"{REMOTE_ROOT}/agent-source"
+REMOTE_ROOT_PREFIX = "/tmp/nemo-gym-nooa-"
 LOG = logging.getLogger(__name__)
 
 
@@ -30,6 +29,7 @@ LOG = logging.getLogger(__name__)
 class AcquiredSandbox:
     sandbox: AsyncSandbox
     owned: bool
+    cleanup_url_path: str | None = None
 
 
 @dataclass(slots=True)
@@ -40,6 +40,7 @@ class SandboxExecution:
     stdout: str
     stderr: str
     wall_time_s: float
+    artifacts_path: str | None = None
 
 
 def _sandbox_spec(config: NOOASandboxedAgentConfig, default_metadata: dict[str, Any]) -> SandboxSpec:
@@ -75,15 +76,34 @@ async def acquire_sandbox(
     resolved_provider: dict[str, Any],
     default_metadata: dict[str, Any],
 ) -> AcquiredSandbox:
+    cleanup_url_path = seed_response.get("cleanup_url_path")
+    if cleanup_url_path is not None and (
+        not isinstance(cleanup_url_path, str) or not cleanup_url_path.startswith("/")
+    ):
+        raise ValueError("cleanup_url_path must be an absolute URL path")
+
     lease = seed_response.get("sandbox_lease")
-    if isinstance(lease, dict):
+    if isinstance(lease, Mapping):
         descriptor = lease.get("descriptor")
-        if not isinstance(descriptor, dict):
+        if not isinstance(descriptor, Mapping):
             raise ValueError("sandbox_lease.descriptor must be an object")
+        ownership = lease.get("ownership", "resources")
+        if ownership not in {"agent", "resources"}:
+            raise ValueError("sandbox_lease.ownership must be 'agent' or 'resources'")
         provider = create_provider(resolved_provider)
         return AcquiredSandbox(
-            sandbox=await AsyncSandbox.connect(descriptor, provider=provider),
-            owned=lease.get("ownership", "resources") == "agent",
+            sandbox=await AsyncSandbox.connect(dict(descriptor), provider=provider),
+            owned=ownership == "agent",
+            cleanup_url_path=cleanup_url_path,
+        )
+
+    descriptor = seed_response.get("sandbox_descriptor")
+    if isinstance(descriptor, Mapping):
+        provider = create_provider(resolved_provider)
+        return AcquiredSandbox(
+            sandbox=await AsyncSandbox.connect(dict(descriptor), provider=provider),
+            owned=False,
+            cleanup_url_path=cleanup_url_path,
         )
 
     legacy_handle = seed_response.get("sandbox_handle")
@@ -92,11 +112,12 @@ async def acquire_sandbox(
         return AcquiredSandbox(
             sandbox=await AsyncSandbox.connect({"sandbox_id": legacy_handle}, provider=provider),
             owned=False,
+            cleanup_url_path=cleanup_url_path,
         )
 
     sandbox = AsyncSandbox(resolved_provider, _sandbox_spec(config, default_metadata))
     await sandbox.start()
-    return AcquiredSandbox(sandbox=sandbox, owned=True)
+    return AcquiredSandbox(sandbox=sandbox, owned=True, cleanup_url_path=cleanup_url_path)
 
 
 async def release_sandbox(acquired: AcquiredSandbox) -> None:
@@ -106,11 +127,18 @@ async def release_sandbox(acquired: AcquiredSandbox) -> None:
         await acquired.sandbox.detach()
 
 
-async def _stage_archive(sandbox: AsyncSandbox, local_path: str, remote_name: str, target: str) -> None:
+async def _stage_archive(
+    sandbox: AsyncSandbox,
+    local_path: str,
+    remote_name: str,
+    target: str,
+    *,
+    remote_root: str,
+) -> None:
     archive = Path(local_path).expanduser().resolve()
     if not archive.is_file():
         raise ValueError(f"runtime archive not found: {archive}")
-    remote_archive = f"{REMOTE_ROOT}/{remote_name}"
+    remote_archive = f"{remote_root}/{remote_name}"
     await sandbox.upload(archive, remote_archive)
     command = (
         f"mkdir -p {shlex.quote(target)} && "
@@ -128,18 +156,28 @@ async def execute_in_sandbox(
     config: NOOASandboxedAgentConfig,
 ) -> SandboxExecution:
     sandbox = acquired.sandbox
-    request = request.model_copy(update={"artifacts_dir": REMOTE_ARTIFACTS})
+    run_id = uuid4().hex
+    remote_root = f"{REMOTE_ROOT_PREFIX}{run_id}"
+    remote_request = f"{remote_root}/request.json"
+    remote_runner = f"{remote_root}/sandbox_runner.py"
+    remote_artifacts = f"{remote_root}/artifacts"
+    remote_agent_source = f"{remote_root}/agent-source"
+    runtime_extract_dir = f"{config.runtime.extract_dir}-{run_id}"
+    request = request.model_copy(update={"artifacts_dir": remote_artifacts})
     runner_path = Path(__file__).with_name("sandbox_runner.py")
+    local_artifacts = Path(config.results_dir).expanduser().resolve() / run_id if config.results_dir else None
+    if local_artifacts is not None:
+        local_artifacts.mkdir(parents=True, exist_ok=False)
     with tempfile.TemporaryDirectory(prefix="nemo-gym-nooa-") as temporary_dir:
         local_request = Path(temporary_dir) / "request.json"
         local_request.write_text(request.model_dump_json(), encoding="utf-8")
         prepare = await sandbox.exec(
-            f"rm -rf {shlex.quote(REMOTE_ROOT)} && mkdir -p {shlex.quote(REMOTE_ARTIFACTS)}",
+            f"mkdir -p {shlex.quote(remote_artifacts)}",
             timeout_s=30,
         )
         if prepare.return_code != 0 or prepare.error_type:
             raise RuntimeError(f"failed to prepare sandbox runner directory: {(prepare.stderr or '')[:1000]}")
-        await sandbox.upload(runner_path, REMOTE_RUNNER)
+        await sandbox.upload(runner_path, remote_runner)
 
         python = config.runtime.python
         if config.runtime.source == "archive":
@@ -148,24 +186,31 @@ async def execute_in_sandbox(
                 sandbox,
                 config.runtime.archive_path,
                 "runtime.tar.gz",
-                config.runtime.extract_dir,
+                runtime_extract_dir,
+                remote_root=remote_root,
             )
-            python = f"{config.runtime.extract_dir}/bin/python"
+            python = f"{runtime_extract_dir}/bin/python"
         if config.agent.source_archive:
-            await _stage_archive(sandbox, config.agent.source_archive, "agent-source.tar.gz", REMOTE_AGENT_SOURCE)
+            await _stage_archive(
+                sandbox,
+                config.agent.source_archive,
+                "agent-source.tar.gz",
+                remote_agent_source,
+                remote_root=remote_root,
+            )
 
         check = await sandbox.exec(f"test -x {shlex.quote(python)}", timeout_s=30)
         if check.return_code != 0:
             raise RuntimeError(f"sandbox NOOA Python is not executable: {python}")
 
         pythonpath = (
-            [REMOTE_AGENT_SOURCE, *config.agent.pythonpath] if config.agent.source_archive else config.agent.pythonpath
+            [remote_agent_source, *config.agent.pythonpath] if config.agent.source_archive else config.agent.pythonpath
         )
         env = {
-            "NOOA_SANDBOX_REQUEST": REMOTE_REQUEST,
+            "NOOA_SANDBOX_REQUEST": remote_request,
             "PYTHONPATH": ":".join(pythonpath),
-            "HOME": f"{REMOTE_ROOT}/home",
-            "TMPDIR": f"{REMOTE_ROOT}/tmp",
+            "HOME": f"{remote_root}/home",
+            "TMPDIR": f"{remote_root}/tmp",
         }
         prepare_home = await sandbox.exec(
             f"mkdir -p {shlex.quote(env['HOME'])} {shlex.quote(env['TMPDIR'])}",
@@ -173,23 +218,25 @@ async def execute_in_sandbox(
         )
         if prepare_home.return_code != 0 or prepare_home.error_type:
             raise RuntimeError(f"failed to prepare sandbox runtime directories: {(prepare_home.stderr or '')[:1000]}")
-        # Upload the signed request only once every other preparation step has
-        # succeeded. The runner unlinks it immediately after parsing.
-        await sandbox.upload(local_request, REMOTE_REQUEST)
+        # Upload the request only once every other preparation step has succeeded.
+        # The runner unlinks it immediately after parsing.
+        await sandbox.upload(local_request, remote_request)
         started = time.perf_counter()
         execution = await sandbox.exec(
-            f"{shlex.quote(python)} {shlex.quote(REMOTE_RUNNER)}",
+            f"{shlex.quote(python)} {shlex.quote(remote_runner)}",
+            cwd=config.runtime.workdir,
             env=env,
             timeout_s=config.timeout_s,
         )
         wall_time_s = max(0.0, time.perf_counter() - started)
 
         try:
-            local_result = Path(temporary_dir) / "result.json"
-            exists = await sandbox.exec(f"test -f {shlex.quote(REMOTE_ARTIFACTS + '/result.json')}", timeout_s=30)
+            local_result = (local_artifacts or Path(temporary_dir)) / "result.json"
+            exists = await sandbox.exec(f"test -f {shlex.quote(remote_artifacts + '/result.json')}", timeout_s=30)
             if exists.return_code == 0:
-                await sandbox.download(f"{REMOTE_ARTIFACTS}/result.json", local_result)
+                await sandbox.download(f"{remote_artifacts}/result.json", local_result)
                 if local_result.stat().st_size > config.max_artifact_bytes:
+                    local_result.unlink()
                     raise ValueError(f"NOOA result artifact exceeds max_artifact_bytes={config.max_artifact_bytes}")
                 result = NOOASandboxResult.model_validate_json(local_result.read_text(encoding="utf-8"))
             else:
@@ -201,11 +248,39 @@ async def execute_in_sandbox(
                     ],
                     observation_gaps=["result_artifact_unavailable"],
                 )
+                if local_artifacts is not None:
+                    local_result.write_text(result.model_dump_json(), encoding="utf-8")
+
+            if local_artifacts is not None:
+                for artifact_name in ("events.jsonl", "traceback.log"):
+                    remote_path = f"{remote_artifacts}/{artifact_name}"
+                    exists = await sandbox.exec(f"test -f {shlex.quote(remote_path)}", timeout_s=30)
+                    if exists.return_code != 0:
+                        continue
+                    local_path = local_artifacts / artifact_name
+                    await sandbox.download(remote_path, local_path)
+                    if local_path.stat().st_size > config.max_artifact_bytes:
+                        local_path.unlink()
+                        LOG.warning("Skipped oversized NOOA artifact %s", remote_path)
+
+                (local_artifacts / "execution.json").write_text(
+                    json.dumps(
+                        {
+                            "return_code": execution.return_code,
+                            "error_type": execution.error_type,
+                            "stdout": execution.stdout or "",
+                            "stderr": execution.stderr or "",
+                            "wall_time_s": wall_time_s,
+                        },
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
         finally:
             try:
-                cleanup_paths = [REMOTE_ROOT]
+                cleanup_paths = [remote_root]
                 if config.runtime.source == "archive":
-                    cleanup_paths.append(config.runtime.extract_dir)
+                    cleanup_paths.append(runtime_extract_dir)
                 quoted_paths = " ".join(shlex.quote(path) for path in cleanup_paths)
                 await sandbox.exec(f"rm -rf {quoted_paths}", timeout_s=30)
             except Exception:
@@ -218,4 +293,5 @@ async def execute_in_sandbox(
         stdout=execution.stdout or "",
         stderr=execution.stderr or "",
         wall_time_s=wall_time_s,
+        artifacts_path=str(local_artifacts) if local_artifacts is not None else None,
     )

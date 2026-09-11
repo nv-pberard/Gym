@@ -167,3 +167,26 @@ async def test_runner_preserves_model_tool_call_id_for_generated_code(
     assert "call_codeact_smoke" in code_tool_call_ids
     prefill = next(tool for tool in result["tool_calls"] if tool["tool_call_id"].startswith("prefill_"))
     assert "Task: solve()" in prefill["output"]["stdout"]
+
+
+async def test_runner_rejects_unexpected_nooa_runtime_version(tmp_path: Path) -> None:
+    artifacts = tmp_path / "artifacts"
+    request_path = tmp_path / "request.json"
+    request = NOOASandboxRequest(
+        rollout_id="rollout-version",
+        task_id="task-version",
+        agent_class="smoke_agent:SmokeAgent",
+        entrypoint="solve",
+        model=NOOAModelEndpoint(url="http://127.0.0.1:1/v1/responses", server_name="policy_model"),
+        expected_nooa_version="999.0.0",
+        artifacts_dir=str(artifacts),
+    )
+    request_path.write_text(request.model_dump_json(), encoding="utf-8")
+
+    return_code = await run(request_path)
+
+    result = json.loads((artifacts / "result.json").read_text(encoding="utf-8"))
+    assert return_code == 2
+    assert result["status"] == "failed"
+    assert "does not match expected" in result["error"]
+    assert result["runtime"]["nooa_version"] != "999.0.0"

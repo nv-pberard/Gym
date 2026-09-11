@@ -159,5 +159,5 @@ def test_projection_exposes_nooa_failure_on_response() -> None:
         "nooa_status": "model_budget_exceeded",
         "nooa_error": "NOOA rollout exceeded 2 model calls",
     }
-    assert response.output[0].status == "incomplete"
+    assert response.output == []
     assert any(gap.code == "native_invocation_unavailable" for gap in observations.gaps)
