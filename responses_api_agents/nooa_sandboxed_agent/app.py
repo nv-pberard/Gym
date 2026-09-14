@@ -33,7 +33,7 @@ from nemo_gym.rollout_observability import (
     TrajectoryRecord,
 )
 from nemo_gym.sandbox.config import resolve_provider_config, resolve_provider_metadata
-from nemo_gym.server_utils import get_response_json, raise_for_status
+from nemo_gym.server_utils import get_response_json, is_nemo_gym_fastapi_entrypoint, raise_for_status
 from responses_api_agents.nooa_sandboxed_agent.config import NOOASandboxedAgentConfig
 from responses_api_agents.nooa_sandboxed_agent.mapping import materialize_arguments
 from responses_api_agents.nooa_sandboxed_agent.projection import project_result
@@ -444,3 +444,5 @@ class NOOASandboxedAgent(SimpleResponsesAPIAgent):
 
 if __name__ == "__main__":
     NOOASandboxedAgent.run_webserver()
+elif is_nemo_gym_fastapi_entrypoint(__file__):
+    app = NOOASandboxedAgent.run_webserver()  # noqa: F401
