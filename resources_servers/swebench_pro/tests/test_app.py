@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import asyncio
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -30,6 +31,7 @@ from resources_servers.swebench_pro.app import (
     SWEBenchProSeedSessionRequest,
     _attempt_budget,
     _budget_spent,
+    build_model_patch_command,
 )
 from resources_servers.swebench_pro.verification import VerificationResult
 
@@ -235,10 +237,40 @@ async def test_extract_model_patch_includes_commits_and_untracked_files() -> Non
 
     assert patch == "complete patch"
     command = sandbox.exec.await_args.args[0]
-    assert "git -C /app add -N ." in command
-    assert "git -C /app --no-pager diff abc123" in command
+    assert "git -C /app add" not in command
+    assert "git -C /app --no-pager diff --no-ext-diff abc123 --" in command
+    assert "git -C /app ls-files --others --exclude-standard" in command
+    assert 'git -C /app --no-pager diff --no-ext-diff --no-index -- /dev/null "$ng_path"' in command
     sandbox.stop.assert_awaited_once()
     assert "session" not in server._session_id_to_sandbox
+
+
+def test_model_patch_command_is_read_only_and_includes_untracked_files(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "--quiet"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "NeMo Gym Test"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    (repo / "tracked.txt").write_text("before\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", "base"], cwd=repo, check=True)
+    base_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+    (repo / "tracked.txt").write_text("after\n", encoding="utf-8")
+    (repo / "new file.txt").write_text("new\n", encoding="utf-8")
+    index_before = (repo / ".git" / "index").read_bytes()
+
+    result = subprocess.run(
+        ["sh", "-c", build_model_patch_command(base_commit, str(repo))],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "diff --git a/tracked.txt b/tracked.txt" in result.stdout
+    assert "diff --git a/new file.txt b/new file.txt" in result.stdout
+    assert "+new" in result.stdout
+    assert (repo / ".git" / "index").read_bytes() == index_before
 
 
 @pytest.mark.asyncio

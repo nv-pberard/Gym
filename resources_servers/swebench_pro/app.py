@@ -75,6 +75,19 @@ HARNESS_ENV_TO_SCRUB = (
 )
 
 
+def build_model_patch_command(base_commit: str, workspace: str = "/app") -> str:
+    git = f"git -C {quote(workspace)}"
+    # Render agent-created, untracked files as patches without staging them or modifying the Git index.
+    untracked_diff = (
+        f"{git} ls-files --others --exclude-standard | "
+        "while IFS= read -r ng_path; do "
+        f'{git} --no-pager diff --no-ext-diff --no-index -- /dev/null "$ng_path"; '
+        'ng_status=$?; [ "$ng_status" -le 1 ] || exit "$ng_status"; '
+        "done"
+    )
+    return f"{git} --no-pager diff --no-ext-diff {quote(base_commit)} -- && {untracked_diff}"
+
+
 def _verification_deadline(total_timeout: float | None) -> float | None:
     """Wall-clock instant by which all attempts for one rollout must be done."""
     return None if total_timeout is None else time() + total_timeout
@@ -393,9 +406,7 @@ class SWEBenchProResourcesServer(SimpleResourcesServer):
         original_sandbox = self._session_id_to_sandbox[session_id]
         pristine_untracked = self._session_id_to_pristine_untracked.get(session_id, frozenset())
         try:
-            result = await original_sandbox.exec(
-                f"git -C /app add -N . && git -C /app --no-pager diff {quote(base_commit)}"
-            )
+            result = await original_sandbox.exec(build_model_patch_command(base_commit))
             if result.return_code != 0:
                 raise RuntimeError(result.stderr or "git diff failed")
             return drop_patch_sections(result.stdout or "", pristine_untracked)
