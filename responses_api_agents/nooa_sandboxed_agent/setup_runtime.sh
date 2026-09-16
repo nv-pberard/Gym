@@ -5,12 +5,16 @@
 set -euo pipefail
 
 export PYTHONNOUSERSITE=1
+export UV_LINK_MODE=copy
 
 : "${NOOA_RUNTIME_DIR:?NOOA_RUNTIME_DIR is required}"
 : "${NOOA_RUNTIME_REQUIREMENTS:?NOOA_RUNTIME_REQUIREMENTS is required}"
 : "${NOOA_PYTHON_VERSION:?NOOA_PYTHON_VERSION is required}"
 : "${NOOA_PBS_RELEASE:?NOOA_PBS_RELEASE is required}"
 : "${NOOA_RUNTIME_ARCH:?NOOA_RUNTIME_ARCH is required}"
+# uv's resolution target does not control the prefix's site-packages layout.
+# Select a matching host interpreter explicitly for cross-libc/cross-arch builds.
+export UV_PYTHON="$NOOA_PYTHON_VERSION"
 
 portable_python_can_run() {
     "$NOOA_RUNTIME_DIR/bin/python3" -c "" >/dev/null 2>&1

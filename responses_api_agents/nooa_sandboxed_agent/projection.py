@@ -128,8 +128,11 @@ def project_result(
             )
         )
 
+    budget_stop = result.status == "model_budget_exceeded" and result.budget_exhausted
     response_error = (
-        ResponseError(code="server_error", message=result.error[:2000]) if result.error is not None else None
+        ResponseError(code="server_error", message=result.error[:2000])
+        if result.error is not None and not budget_stop
+        else None
     )
     response = NeMoGymResponse(
         id=f"resp_nooa_{uuid4().hex}",
@@ -141,10 +144,14 @@ def project_result(
         if result.status == "completed"
         else "cancelled"
         if result.status == "cancelled"
+        else "incomplete"
+        if budget_stop
         else "failed",
         error=response_error,
         metadata={
             "nooa_status": result.status,
+            "budget_exhausted": str(budget_stop).lower(),
+            **({"stop_reason": result.stop_reason} if result.stop_reason is not None else {}),
             **({"nooa_error": result.error[:2000]} if result.error is not None else {}),
         },
         parallel_tool_calls=responses_create_params.parallel_tool_calls,

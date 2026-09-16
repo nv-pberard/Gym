@@ -150,12 +150,37 @@ async def _stage_archive(
         raise RuntimeError(f"failed to extract {archive.name}: {(result.stderr or '')[:1000]}")
 
 
+async def _select_runtime_archive(sandbox: AsyncSandbox, archives: Mapping[str, str]) -> str:
+    """Select the portable runtime matching the task image's CPU and libc."""
+    if not archives:
+        raise RuntimeError("runtime.source=auto requires prepared runtime archives")
+    if len(archives) == 1:
+        return next(iter(archives.values()))
+    probe = await sandbox.exec(
+        "uname -m; if ls /lib/ld-musl-*.so.1 >/dev/null 2>&1; then printf musl; else printf gnu; fi",
+        timeout_s=30,
+    )
+    if probe.return_code != 0 or probe.error_type:
+        raise RuntimeError(f"failed to identify sandbox runtime platform: {(probe.stderr or '')[:1000]}")
+    lines = (probe.stdout or "").splitlines()
+    if len(lines) < 2:
+        raise RuntimeError(f"sandbox runtime platform probe returned malformed output: {probe.stdout!r}")
+    machine, libc = lines[0].strip(), lines[-1].strip()
+    architecture = f"{machine}-unknown-linux-{libc}"
+    try:
+        return archives[architecture]
+    except KeyError as exc:
+        raise RuntimeError(
+            f"no portable NOOA runtime for {architecture}; configured architectures: {sorted(archives)}"
+        ) from exc
+
+
 async def execute_in_sandbox(
     acquired: AcquiredSandbox,
     request: NOOASandboxRequest,
     config: NOOASandboxedAgentConfig,
     *,
-    runtime_archive_path: str | None = None,
+    runtime_archive_paths: Mapping[str, str] | None = None,
 ) -> SandboxExecution:
     sandbox = acquired.sandbox
     run_id = uuid4().hex
@@ -186,9 +211,13 @@ async def execute_in_sandbox(
 
         python = config.runtime.python
         if config.runtime.source in {"auto", "archive"}:
-            archive_path = config.runtime.archive_path if config.runtime.source == "archive" else runtime_archive_path
+            archive_path = (
+                config.runtime.archive_path
+                if config.runtime.source == "archive"
+                else await _select_runtime_archive(sandbox, runtime_archive_paths or {})
+            )
             if archive_path is None:
-                raise RuntimeError("runtime.source=auto requires a prepared runtime archive")
+                raise RuntimeError("runtime archive path is unavailable")
             await _stage_archive(
                 sandbox,
                 archive_path,

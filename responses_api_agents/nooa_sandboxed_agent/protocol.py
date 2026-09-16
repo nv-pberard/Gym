@@ -97,6 +97,8 @@ class NOOASandboxResult(StrictModel):
     return_value: Any = None
     return_type: str | None = None
     error: str | None = None
+    budget_exhausted: bool = False
+    stop_reason: str | None = None
     model_calls: list[NOOAModelCallArtifact] = Field(default_factory=list)
     tool_calls: list[NOOAToolArtifact] = Field(default_factory=list)
     invocations: list[NOOAInvocationArtifact] = Field(default_factory=list)

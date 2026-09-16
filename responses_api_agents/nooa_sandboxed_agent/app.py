@@ -125,12 +125,14 @@ def _sandbox_outcome(execution: SandboxExecution) -> str:
 
 def _is_scored(row: Mapping[str, Any]) -> bool:
     reward = row.get("reward")
+    status = row.get("nooa_status")
+    budget_stop = status == "model_budget_exceeded" and row.get("score_valid") is True
     return (
         not row.get("_ng_failure_class")
         and row.get("score_valid") is not False
         and row.get("mask_sample") is not True
-        and row.get("nooa_finished") is not False
-        and row.get("nooa_status") in {None, "completed"}
+        and (row.get("nooa_finished") is not False or budget_stop)
+        and status in {None, "completed", "model_budget_exceeded"}
         and isinstance(reward, (int, float))
         and not isinstance(reward, bool)
     )
@@ -140,13 +142,18 @@ class NOOASandboxedAgent(SimpleResponsesAPIAgent):
     """Provider-neutral host orchestrator; it deliberately never imports NOOA."""
 
     config: NOOASandboxedAgentConfig
-    _runtime_archive_path: str | None = PrivateAttr(default=None)
+    _runtime_archive_paths: dict[str, str] = PrivateAttr(default_factory=dict)
 
     def model_post_init(self, context: Any, /) -> None:
         super().model_post_init(context)
         self._semaphore = asyncio.Semaphore(self.config.concurrency)
         if self.config.runtime.source == "auto":
-            self._runtime_archive_path = str(prepare_runtime_archive(self.config.runtime))
+            for architecture in [
+                self.config.runtime.architecture,
+                *self.config.runtime.alternative_architectures,
+            ]:
+                runtime_config = self.config.runtime.model_copy(update={"architecture": architecture})
+                self._runtime_archive_paths[architecture] = str(prepare_runtime_archive(runtime_config))
 
     def _server_base_url(self, server_name: str) -> str:
         server_config = get_first_server_config_dict(self.server_client.global_config_dict, server_name)
@@ -292,7 +299,7 @@ class NOOASandboxedAgent(SimpleResponsesAPIAgent):
                 acquired,
                 self._sandbox_request(body, seed_json, rollout_id=rollout_id, task_id=task_id),
                 self.config,
-                runtime_archive_path=self._runtime_archive_path,
+                runtime_archive_paths=self._runtime_archive_paths,
             )
             sandbox_observation = SandboxObservation(
                 role="agent",
@@ -336,10 +343,27 @@ class NOOASandboxedAgent(SimpleResponsesAPIAgent):
 
     async def run(self, request: Request, body: NOOASandboxedRunRequest) -> NOOASandboxedVerifyResponse:
         async with self._semaphore:
-            agent_response, observations, trajectory, execution, acquired, cookies = await self._execute(
-                body,
-                cookies=dict(request.cookies),
-            )
+            try:
+                agent_response, observations, trajectory, execution, acquired, cookies = await self._execute(
+                    body,
+                    cookies=dict(request.cookies),
+                )
+            except Exception as exc:
+                LOG.exception("NOOA rollout failed")
+                failure_reason = f"{type(exc).__name__}: {exc}"
+                return NOOASandboxedVerifyResponse.model_validate(
+                    body.model_dump(mode="json")
+                    | {
+                        "nooa_status": "failed",
+                        "nooa_finished": False,
+                        "score_valid": False,
+                        "failure_kind": "harness_error",
+                        "failure_reason": failure_reason,
+                        "mask_sample": True,
+                        "_ng_failure_class": "agent_run_error",
+                        "_ng_failure_message": failure_reason,
+                    }
+                )
             try:
                 agent_json = agent_response.model_dump(mode="json")
                 if self.config.skip_verification:
@@ -369,7 +393,8 @@ class NOOASandboxedAgent(SimpleResponsesAPIAgent):
                 )
                 failure_kind = None
                 failure_reason = None
-                if not nooa_finished:
+                budget_stop = execution.result.status == "model_budget_exceeded" and execution.result.budget_exhausted
+                if not nooa_finished and not budget_stop:
                     failure_kind = "harness_incomplete" if execution.result.status == "cancelled" else "harness_error"
                     failure_reason = (
                         execution.result.error
@@ -416,6 +441,25 @@ class NOOASandboxedAgent(SimpleResponsesAPIAgent):
                     "ng_trajectory": trajectory.model_dump(mode="json"),
                 }
                 return NOOASandboxedVerifyResponse.model_validate(result)
+            except Exception as exc:
+                LOG.exception("NOOA verification failed")
+                failure_reason = f"{type(exc).__name__}: {exc}"
+                return NOOASandboxedVerifyResponse.model_validate(
+                    body.model_dump(mode="json")
+                    | {
+                        "nooa_status": execution.result.status,
+                        "nooa_finished": False,
+                        "nooa_results_path": execution.artifacts_path,
+                        "nooa_run_stdout": execution.stdout,
+                        "nooa_run_stderr": execution.stderr,
+                        "score_valid": False,
+                        "failure_kind": "verification_error",
+                        "failure_reason": failure_reason,
+                        "mask_sample": True,
+                        "_ng_failure_class": "agent_run_error",
+                        "_ng_failure_message": failure_reason,
+                    }
+                )
             finally:
                 await self._release(acquired, cookies)
 

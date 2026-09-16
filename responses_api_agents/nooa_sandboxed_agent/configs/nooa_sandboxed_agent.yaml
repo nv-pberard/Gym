@@ -55,6 +55,9 @@ nooa_sandboxed_agent:
         python_version: 3.13.14
         python_build_standalone_release: "20260805"
         architecture: x86_64-unknown-linux-gnu
+        # Build additional archives for heterogeneous task images when needed,
+        # for example [x86_64-unknown-linux-musl] for Alpine.
+        alternative_architectures: []
         python: /opt/nooa/bin/python
         extract_dir: /tmp/nemo-gym-nooa-runtime
         # Null preserves the sandbox provider's configured working directory.

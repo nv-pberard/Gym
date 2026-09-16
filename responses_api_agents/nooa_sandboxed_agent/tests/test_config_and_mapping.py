@@ -84,3 +84,11 @@ def test_runtime_workdir_must_be_an_absolute_non_root_path() -> None:
         NOOARuntimeConfig(workdir="app")
     with pytest.raises(ValidationError, match="non-empty or null"):
         NOOARuntimeConfig(expected_nooa_version="")
+
+
+def test_runtime_architectures_must_be_unique() -> None:
+    with pytest.raises(ValidationError, match="must be unique"):
+        NOOARuntimeConfig(
+            architecture="x86_64-unknown-linux-gnu",
+            alternative_architectures=["x86_64-unknown-linux-gnu"],
+        )

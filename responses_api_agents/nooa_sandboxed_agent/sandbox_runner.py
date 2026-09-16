@@ -16,6 +16,7 @@ import importlib.metadata
 import inspect
 import json
 import os
+import signal
 import sys
 import time
 import traceback
@@ -34,6 +35,10 @@ class ModelCallBudgetExceeded(RuntimeError):
 
 
 class InvalidPolicyOutput(RuntimeError):
+    pass
+
+
+class SandboxTimeBudgetExceeded(BaseException):
     pass
 
 
@@ -745,6 +750,8 @@ async def run(request_path: Path) -> int:
         "return_value": None,
         "return_type": None,
         "error": None,
+        "budget_exhausted": False,
+        "stop_reason": None,
         "model_calls": [],
         "tool_calls": [],
         "invocations": [],
@@ -757,6 +764,12 @@ async def run(request_path: Path) -> int:
     }
 
     timeout = aiohttp.ClientTimeout(total=None, connect=60, sock_read=900)
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def on_sigterm(_signum: int, _frame: Any) -> None:
+        raise SandboxTimeBudgetExceeded("NOOA sandbox wall-time budget exhausted")
+
+    signal.signal(signal.SIGTERM, on_sigterm)
     try:
         import nooa
         from nooa import Agent
@@ -868,7 +881,22 @@ async def run(request_path: Path) -> int:
                 return_type=_qualified_type(return_value),
             )
     except ModelCallBudgetExceeded as error:
-        result.update(status="model_budget_exceeded", error=str(error))
+        result.update(
+            status="model_budget_exceeded",
+            error=str(error),
+            budget_exhausted=True,
+            stop_reason="max_model_calls",
+        )
+    except SandboxTimeBudgetExceeded as error:
+        if recorder.model_calls:
+            result.update(
+                status="model_budget_exceeded",
+                error=str(error),
+                budget_exhausted=True,
+                stop_reason="wall_time",
+            )
+        else:
+            result.update(status="cancelled", error=str(error))
     except InvalidPolicyOutput as error:
         result.update(status="invalid_policy_output", error=str(error))
     except asyncio.CancelledError:
@@ -887,8 +915,11 @@ async def run(request_path: Path) -> int:
         else:
             status = "failed"
         result.update(status=status, error=f"{type(error).__name__}: {error}")
+        if status == "model_budget_exceeded":
+            result.update(budget_exhausted=True, stop_reason="max_model_calls")
         (artifacts_dir / "traceback.log").write_text(traceback.format_exc(), encoding="utf-8")
     finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
         result["model_calls"] = recorder.model_calls
         result["tool_calls"] = recorder.tool_calls
         result["invocations"] = list(recorder.invocations.values())

@@ -27,6 +27,7 @@ from responses_api_agents.nooa_sandboxed_agent.runtime import (
     AcquiredSandbox,
     SandboxExecution,
     _sandbox_spec,
+    _select_runtime_archive,
     acquire_sandbox,
     execute_in_sandbox,
     release_sandbox,
@@ -218,6 +219,24 @@ async def test_cleanup_failure_does_not_prevent_local_release() -> None:
     sandbox.detach.assert_awaited_once_with()
 
 
+@pytest.mark.parametrize(
+    ("probe", "expected"),
+    [("x86_64\ngnu", "/gnu.tar.gz"), ("x86_64\nmusl", "/musl.tar.gz")],
+)
+async def test_select_runtime_archive_matches_sandbox_libc(probe: str, expected: str) -> None:
+    sandbox = SimpleNamespace(exec=AsyncMock(return_value=SandboxExecResult(return_code=0, stdout=probe, stderr="")))
+
+    selected = await _select_runtime_archive(
+        sandbox,
+        {
+            "x86_64-unknown-linux-gnu": "/gnu.tar.gz",
+            "x86_64-unknown-linux-musl": "/musl.tar.gz",
+        },
+    )
+
+    assert selected == expected
+
+
 def test_agent_failure_is_not_reported_as_sandbox_failure() -> None:
     execution = SandboxExecution(
         result=NOOASandboxResult(status="model_budget_exceeded", error="budget exhausted"),
@@ -235,6 +254,15 @@ def test_agent_failure_is_not_reported_as_sandbox_failure() -> None:
     ("row", "expected"),
     [
         ({"reward": 1.0, "nooa_status": "completed", "nooa_finished": True}, True),
+        (
+            {
+                "reward": 0.0,
+                "nooa_status": "model_budget_exceeded",
+                "nooa_finished": False,
+                "score_valid": True,
+            },
+            True,
+        ),
         ({"reward": 0.0, "nooa_status": "failed", "nooa_finished": False}, False),
         ({"reward": 0.0, "score_valid": False}, False),
         ({"reward": 0.0, "mask_sample": True}, False),
@@ -274,11 +302,16 @@ async def test_aggregate_metrics_filters_failures_and_reports_coverage(monkeypat
     }
 
 
-async def test_run_excludes_failed_nooa_attempt_from_scoring(monkeypatch) -> None:
+async def test_run_preserves_model_budget_stop_score(monkeypatch) -> None:
     server_client = MagicMock(spec=ServerClient)
     server = NOOASandboxedAgent(config=_config(), server_client=server_client)
     body = NOOASandboxedRunRequest(responses_create_params=NeMoGymResponseCreateParamsNonStreaming(input="solve"))
-    nooa_result = NOOASandboxResult(status="model_budget_exceeded", error="budget exhausted")
+    nooa_result = NOOASandboxResult(
+        status="model_budget_exceeded",
+        error="budget exhausted",
+        budget_exhausted=True,
+        stop_reason="max_model_calls",
+    )
     sandbox_observation = SandboxObservation(
         role="agent",
         provider="fake",
@@ -329,14 +362,30 @@ async def test_run_excludes_failed_nooa_attempt_from_scoring(monkeypatch) -> Non
 
     wire = result.model_dump(mode="json")
     assert result.nooa_finished is False
+    assert result.score_valid is True
+    assert result.failure_kind is None
+    assert result.verifier_reward is None
+    assert result.mask_sample is False
+    assert wire["reward"] == 0.0
+    assert wire["response"]["status"] == "incomplete"
+    assert wire["response"]["metadata"]["budget_exhausted"] == "true"
+    assert "_ng_failure_class" not in wire
+    release.assert_awaited_once_with(acquired, {"session": "seeded"})
+
+
+async def test_run_returns_unscored_diagnostic_when_seed_fails(monkeypatch) -> None:
+    server = NOOASandboxedAgent(config=_config(), server_client=MagicMock(spec=ServerClient))
+    body = NOOASandboxedRunRequest(responses_create_params=NeMoGymResponseCreateParamsNonStreaming(input="solve"))
+    monkeypatch.setattr(NOOASandboxedAgent, "_execute", AsyncMock(side_effect=RuntimeError("seed unavailable")))
+
+    result = await server.run(SimpleNamespace(cookies={}), body)
+
+    wire = result.model_dump(mode="json")
     assert result.score_valid is False
     assert result.failure_kind == "harness_error"
-    assert result.verifier_reward == 0.0
     assert result.mask_sample is True
     assert wire["_ng_failure_class"] == "agent_run_error"
-    assert "reward" not in wire
-    assert "response" not in wire
-    release.assert_awaited_once_with(acquired, {"session": "seeded"})
+    assert "seed unavailable" in wire["_ng_failure_message"]
 
 
 async def test_execute_uses_workdir_unique_root_and_persists_failure_artifacts(tmp_path: Path) -> None:

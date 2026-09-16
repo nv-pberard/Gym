@@ -111,6 +111,7 @@ class NOOARuntimeConfig(BaseModel):
     python_version: str = "3.13.14"
     python_build_standalone_release: str = "20260805"
     architecture: str = "x86_64-unknown-linux-gnu"
+    alternative_architectures: list[str] = Field(default_factory=list)
     python: str = "/opt/nooa/bin/python"
     extract_dir: str = "/tmp/nemo-gym-nooa-runtime"
     workdir: str | None = None
@@ -145,6 +146,11 @@ class NOOARuntimeConfig(BaseModel):
             raise ValueError("runtime.archive_path is required when runtime.source=archive")
         if self.source != "archive" and self.archive_path is not None:
             raise ValueError("runtime.archive_path is only valid when runtime.source=archive")
+        architectures = [self.architecture, *self.alternative_architectures]
+        if any(not value.strip() for value in architectures):
+            raise ValueError("runtime architectures must be non-empty")
+        if len(architectures) != len(set(architectures)):
+            raise ValueError("runtime architectures must be unique")
         return self
 
 

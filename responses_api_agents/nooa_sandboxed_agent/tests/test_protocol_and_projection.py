@@ -156,8 +156,13 @@ def test_projection_preserves_model_and_resource_tool_evidence() -> None:
     assert trajectory.turns[0].model_calls[0].model_ref.name == "policy_model"
 
 
-def test_projection_exposes_nooa_failure_on_response() -> None:
-    result = NOOASandboxResult(status="model_budget_exceeded", error="NOOA rollout exceeded 2 model calls")
+def test_projection_exposes_nooa_budget_stop_as_incomplete_response() -> None:
+    result = NOOASandboxResult(
+        status="model_budget_exceeded",
+        error="NOOA rollout exceeded 2 model calls",
+        budget_exhausted=True,
+        stop_reason="max_model_calls",
+    )
     params = NeMoGymResponseCreateParamsNonStreaming(input="task", model="policy")
     sandbox = SandboxObservation(
         role="agent",
@@ -176,11 +181,12 @@ def test_projection_exposes_nooa_failure_on_response() -> None:
         sandbox_observation=sandbox,
     )
 
-    assert response.status == "failed"
-    assert response.error is not None
-    assert response.error.message == "NOOA rollout exceeded 2 model calls"
+    assert response.status == "incomplete"
+    assert response.error is None
     assert response.metadata == {
         "nooa_status": "model_budget_exceeded",
+        "budget_exhausted": "true",
+        "stop_reason": "max_model_calls",
         "nooa_error": "NOOA rollout exceeded 2 model calls",
     }
     assert response.output == []
