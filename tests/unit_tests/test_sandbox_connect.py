@@ -152,6 +152,27 @@ def test_serialize_then_connect_round_trip(tmp_path: Path) -> None:
     asyncio.run(_run())
 
 
+def test_detach_releases_client_without_stopping_connected_sandbox() -> None:
+    async def _run() -> None:
+        owner_provider = FakeConnectableProvider()
+        owner = await AsyncSandbox(owner_provider, SandboxSpec()).start()
+        descriptor = await owner.serialize()
+
+        borrower_provider = FakeConnectableProvider()
+        borrower = await AsyncSandbox.connect(descriptor, provider=borrower_provider)
+        assert borrower.telemetry_provider_name == "fake_connectable"
+        assert borrower.sandbox_id == descriptor["sandbox_id"]
+
+        await borrower.detach()
+
+        assert await owner.status() is SandboxStatus.RUNNING
+        with pytest.raises(RuntimeError, match="not been started"):
+            await borrower.exec("pwd")
+        await owner.stop()
+
+    asyncio.run(_run())
+
+
 def test_serialize_requires_connect_capability() -> None:
     async def _run() -> None:
         sandbox = await AsyncSandbox(_OpsOnlyProvider(), SandboxSpec()).start()

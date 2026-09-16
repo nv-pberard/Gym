@@ -68,7 +68,7 @@ Use `provider_options.binds` for per-sandbox bind mounts. It accepts either a si
 sandbox_spec:
   provider_options:
     binds:
-      - /datasets/swebench:/datasets/swebench:ro
+      - /datasets/tasks:/datasets/tasks:ro
 ```
 
 These binds are added on top of the provider's staging mount and `exec.default_binds`.
@@ -111,6 +111,14 @@ The provider creates one persistent Apptainer instance per sandbox:
 | Close | `apptainer instance stop <name>` |
 
 Instances are named `nemo-gym-<uuid>`. State written by one command is visible to later commands in the same sandbox.
+
+The provider also implements Gym's sandbox descriptor contract. `await sandbox.serialize()` records the instance name, staging bind, image, and environment; another provider object can pass that descriptor to `AsyncSandbox.connect(...)` and operate on the same live instance. Reconnecting does not transfer lifecycle ownership. A borrower should call `detach()`, while the component that created the instance remains responsible for `stop()`.
+
+<Warning>
+Apptainer descriptors are node-local and user-local. The reconnecting process must run on the same host, must see the descriptor's temporary staging directory, and must have access to the launching user's Apptainer instances. A stale or non-running instance is rejected during connect.
+</Warning>
+
+For task images whose root filesystem must be edited, add `--writable-tmpfs` to `create.extra_start_args`. This creates a writable temporary overlay without modifying the source image.
 
 ## File Transfer
 
