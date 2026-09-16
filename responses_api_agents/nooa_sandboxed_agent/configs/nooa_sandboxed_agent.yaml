@@ -1,0 +1,87 @@
+# Provider-neutral sandboxed NOOA config. Include one sandbox provider config,
+# for example nemo_gym/sandbox/providers/docker/configs/docker.yaml, alongside
+# this file when starting an environment.
+nooa_sandboxed_agent:
+  responses_api_agents:
+    nooa_sandboxed_agent:
+      entrypoint: app.py
+      domain: agent
+      description: Run a configured NOOA agent entirely inside a Gym task sandbox.
+      value: Evaluate or train custom NOOA orchestration while isolating generated code from the Agent server.
+      num_workers: 4
+      resources_server:
+        type: resources_servers
+        # Required: set this to the Resources server that owns task state and verification.
+        name: ???
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      token_id_capture: true
+
+      # Named block supplied by the selected provider config.
+      sandbox_provider: sandbox
+      sandbox_spec:
+        image: nemo-gym-nooa:latest
+        ttl_s: 2700
+        ready_timeout_s: 1200
+        resources:
+          cpu: 1
+          memory_mib: 2048
+          disk_gib: 30
+        provider_options: {}
+        metadata:
+          harness: nooa
+
+      # Override these when the provider cannot reach Gym's configured hostnames
+      # (for example, Docker commonly uses http://host.docker.internal:<port>).
+      sandbox_model_base_url: null
+      # Per-server overrides take precedence and also cover agent.model_aliases.
+      sandbox_model_base_urls: {}
+      sandbox_resources_base_url: null
+
+      # Extra fields sent only to /seed_session. The sandboxed runner does not
+      # use an interactive terminal, so compatible Resources servers can skip it.
+      seed_session_overrides:
+        create_pty: false
+        request_sandbox_lease: true
+
+      runtime:
+        # "baked" expects the image to contain NOOA at /opt/nooa/bin/python.
+        # "archive" uploads and extracts a portable virtual environment per sandbox.
+        # "auto" builds and caches that archive from the pinned runtime requirements.
+        source: baked
+        archive_path: null
+        cache_dir: .runtime
+        python_version: 3.13.14
+        python_build_standalone_release: "20260805"
+        architecture: x86_64-unknown-linux-gnu
+        # Build additional archives for heterogeneous task images when needed,
+        # for example [x86_64-unknown-linux-musl] for Alpine.
+        alternative_architectures: []
+        python: /opt/nooa/bin/python
+        extract_dir: /tmp/nemo-gym-nooa-runtime
+        # Null preserves the sandbox provider's configured working directory.
+        workdir: null
+        expected_nooa_version: 0.0.10
+
+      agent:
+        # Required: sandbox-importable NOOA class in module.path:ClassName form.
+        agent_class: ???
+        entrypoint: run
+        init_kwargs: {}
+        arguments:
+          task:
+            source: responses_create_params.input
+            transform: latest_user_text
+        tool_namespace: resources
+        allowed_tools: []
+        model_aliases: {}
+        source_archive: null
+        pythonpath: []
+
+      max_model_calls: 10
+      timeout_s: 2100
+      concurrency: 8
+      max_artifact_bytes: 67108864
+      results_dir: responses_api_agents/nooa_sandboxed_agent/results
+      datasets: []

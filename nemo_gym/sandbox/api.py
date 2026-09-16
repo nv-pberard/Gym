@@ -398,6 +398,18 @@ class AsyncSandbox:
         """Provider name for span attributes (`docker`, `daytona`, `opensandbox`, ...)."""
         return getattr(self._provider, "name", type(self._provider).__name__)
 
+    @property
+    def telemetry_provider_name(self) -> str:
+        """Return the public provider name without exposing its opaque handle."""
+
+        return self._telemetry_provider_name()
+
+    @property
+    def sandbox_id(self) -> str | None:
+        """Return the provider-neutral sandbox identifier when one is attached."""
+
+        return self._handle.sandbox_id if self._handle is not None else None
+
     def _require_handle(self) -> SandboxHandle:
         if self._handle is None or self._stopped:
             raise RuntimeError("Sandbox has not been started")
@@ -535,6 +547,23 @@ class AsyncSandbox:
                 await self._provider.aclose()
                 self._closed = True
         self._closed = True
+
+    async def detach(self) -> None:
+        """Release local provider resources without terminating the sandbox.
+
+        Use this for a sandbox connected through a lease owned by another
+        component, such as a Resources server that must keep the sandbox alive
+        through verification. The detached object cannot be reused.
+        """
+
+        if self._closed:
+            return
+        try:
+            await self._provider.aclose()
+        finally:
+            self._handle = None
+            self._stopped = True
+            self._closed = True
 
     async def serialize(self, *, scope: str | None = None) -> dict[str, Any]:
         """Return a JSON descriptor another process can rebuild this box from.
@@ -736,6 +765,17 @@ class Sandbox:
         self._closed = True
         try:
             self._runner.run("stop", self._async_sandbox.stop)
+        finally:
+            self._runner.close()
+
+    def detach(self) -> None:
+        """Release local provider resources without terminating the sandbox."""
+
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._runner.run("detach", self._async_sandbox.detach)
         finally:
             self._runner.close()
 

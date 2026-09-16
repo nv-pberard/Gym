@@ -1,0 +1,75 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+config_paths:
+  - responses_api_agents/nooa_sandboxed_agent/configs/nooa_sandboxed_agent.yaml
+  - resources_servers/swebench_pro/configs/swebench_pro.yaml
+
+# Both servers run on the same Linux node and reconnect to the same persistent
+# Apptainer instance. The writable tmpfs is required because the agent edits /app.
+sandbox:
+  default_metadata:
+    sandbox-api: apptainer-cli
+  apptainer:
+    exec:
+      default_timeout_s: 180
+      timeout_grace_s: 15
+      fakeroot_for_root: true
+      concurrency: 32
+    create:
+      mount_point: /sandbox
+      start_timeout_s: 1200
+      extra_start_args: [--writable-tmpfs]
+      # Cluster schedulers generally own cgroup limits for these local processes.
+      apply_resource_limits: false
+    probe:
+      command: printf apptainer-sandbox-ready
+      expected_stdout: apptainer-sandbox-ready
+      timeout_s: 30
+      deadline_s: 120
+
+swebench_pro_nooa_resources_server:
+  _inherit_from: swebench_pro_resources_server
+
+swebench_pro_nooa_sandboxed_agent:
+  _inherit_from: nooa_sandboxed_agent
+  responses_api_agents:
+    nooa_sandboxed_agent:
+      resources_server:
+        type: resources_servers
+        name: swebench_pro_nooa_resources_server
+      seed_session_overrides:
+        create_pty: false
+        request_sandbox_lease: true
+      runtime:
+        source: auto
+        cache_dir: .runtime
+        python_version: 3.13.14
+        python_build_standalone_release: "20260805"
+        architecture: x86_64-unknown-linux-gnu
+        python: /opt/nooa/bin/python
+        extract_dir: /tmp/nemo-gym-nooa-runtime
+        workdir: /app
+        expected_nooa_version: 0.0.10
+      agent:
+        agent_class: gym_nooa_bench_agent:GymBenchAgent
+        entrypoint: solve
+        init_kwargs: {}
+        arguments:
+          task:
+            source: responses_create_params.input
+            transform: latest_user_text
+        tool_namespace: resources
+        allowed_tools: []
+        model_aliases: {}
+        source_archive: null
+        pythonpath: []
+      max_model_calls: 300
+      timeout_s: 3600
+      concurrency: 1
+      datasets:
+        - name: swebench_pro
+          type: benchmark
+          jsonl_fpath: benchmarks/swebench/data/swebench_pro_benchmark.jsonl
+          prepare_script: benchmarks/swebench/pro/prepare.py
+          num_repeats: 3

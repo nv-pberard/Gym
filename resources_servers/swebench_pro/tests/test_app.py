@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import asyncio
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -30,6 +31,7 @@ from resources_servers.swebench_pro.app import (
     SWEBenchProSeedSessionRequest,
     _attempt_budget,
     _budget_spent,
+    build_model_patch_command,
 )
 from resources_servers.swebench_pro.verification import VerificationResult
 
@@ -177,6 +179,7 @@ def test_image_digest_avoids_case_sensitive_tag_rewriting() -> None:
 async def test_seed_session_applies_shared_anti_cheat_setup(monkeypatch: MonkeyPatch) -> None:
     server = make_server(golden=False)
     sandbox = SimpleNamespace(
+        sandbox_id="sandbox-id",
         _handle=SimpleNamespace(sandbox_id="sandbox-id"),
         pty=fake_pty(),
         upload=AsyncMock(),
@@ -204,6 +207,7 @@ async def test_seed_session_applies_shared_anti_cheat_setup(monkeypatch: MonkeyP
 async def test_seed_session_can_skip_anti_cheat_setup(monkeypatch: MonkeyPatch) -> None:
     server = make_server(golden=False, apply_anti_cheating=False)
     sandbox = SimpleNamespace(
+        sandbox_id="sandbox-id",
         _handle=SimpleNamespace(sandbox_id="sandbox-id"),
         pty=fake_pty(),
         upload=AsyncMock(),
@@ -233,10 +237,40 @@ async def test_extract_model_patch_includes_commits_and_untracked_files() -> Non
 
     assert patch == "complete patch"
     command = sandbox.exec.await_args.args[0]
-    assert "git -C /app add -N ." in command
-    assert "git -C /app --no-pager diff abc123" in command
+    assert "git -C /app add" not in command
+    assert "git -C /app --no-pager diff --no-ext-diff abc123 --" in command
+    assert "git -C /app ls-files --others --exclude-standard" in command
+    assert 'git -C /app --no-pager diff --no-ext-diff --no-index -- /dev/null "$ng_path"' in command
     sandbox.stop.assert_awaited_once()
     assert "session" not in server._session_id_to_sandbox
+
+
+def test_model_patch_command_is_read_only_and_includes_untracked_files(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "--quiet"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "NeMo Gym Test"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    (repo / "tracked.txt").write_text("before\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", "base"], cwd=repo, check=True)
+    base_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+    (repo / "tracked.txt").write_text("after\n", encoding="utf-8")
+    (repo / "new file.txt").write_text("new\n", encoding="utf-8")
+    index_before = (repo / ".git" / "index").read_bytes()
+
+    result = subprocess.run(
+        ["sh", "-c", build_model_patch_command(base_commit, str(repo))],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "diff --git a/tracked.txt b/tracked.txt" in result.stdout
+    assert "diff --git a/new file.txt b/new file.txt" in result.stdout
+    assert "+new" in result.stdout
+    assert (repo / ".git" / "index").read_bytes() == index_before
 
 
 @pytest.mark.asyncio
@@ -275,6 +309,7 @@ async def test_seed_session_normalizes_the_agent_environment_before_snapshotting
         return SimpleNamespace(return_code=0, stdout="", stderr="")
 
     sandbox = SimpleNamespace(
+        sandbox_id="sandbox-id",
         exec=record,
         upload=AsyncMock(),
         stop=AsyncMock(),
@@ -301,6 +336,7 @@ async def test_seed_session_survives_a_container_it_cannot_normalize() -> None:
         return SimpleNamespace(return_code=0, stdout="", stderr="")
 
     sandbox = SimpleNamespace(
+        sandbox_id="sandbox-id",
         exec=boom,
         upload=AsyncMock(),
         stop=AsyncMock(),
@@ -320,6 +356,7 @@ async def test_seed_session_returns_the_pty_session_the_agent_attaches_to() -> N
     """The agent needs both ids; given only one it silently builds its own sandbox instead."""
     server = make_server(golden=False)
     sandbox = SimpleNamespace(
+        sandbox_id="sandbox-id",
         exec=AsyncMock(return_value=SimpleNamespace(return_code=0, stdout="", stderr="")),
         upload=AsyncMock(),
         stop=AsyncMock(),
@@ -335,6 +372,102 @@ async def test_seed_session_returns_the_pty_session_the_agent_attaches_to() -> N
     assert response.pty_session_id == "pty-id"
     sandbox.pty.create.assert_awaited_once()
     assert server._session_id_to_pty["session"].session_id == "pty-id"
+
+
+@pytest.mark.asyncio
+async def test_seed_session_returns_resources_owned_lease_without_creating_pty() -> None:
+    server = make_server(golden=False, apply_anti_cheating=False)
+    descriptor = {
+        "version": 1,
+        "provider": "apptainer",
+        "sandbox_id": "nemo-gym-box",
+        "staging_dir": "/tmp/staging",
+        "mount_point": "/sandbox",
+        "image": "docker://image",
+        "env": {},
+        "workdir": "/app",
+    }
+    sandbox = SimpleNamespace(
+        sandbox_id="nemo-gym-box",
+        exec=AsyncMock(return_value=SimpleNamespace(return_code=0, stdout="", stderr="", error_type=None)),
+        upload=AsyncMock(),
+        stop=AsyncMock(),
+        serialize=AsyncMock(return_value=descriptor),
+        pty=fake_pty(),
+    )
+    server._create_sandbox = AsyncMock(return_value=sandbox)
+    request = SimpleNamespace(session={SESSION_ID_KEY: "session"})
+    body = SWEBenchProSeedSessionRequest.model_validate(
+        request_body() | {"create_pty": False, "request_sandbox_lease": True}
+    )
+
+    response = await server.seed_session(request, body)
+
+    assert response.pty_session_id is None
+    assert response.sandbox_lease is not None
+    assert response.sandbox_lease.descriptor == descriptor
+    assert response.sandbox_lease.ownership == "resources"
+    assert response.cleanup_url_path == "/cleanup_session"
+    sandbox.pty.create.assert_not_awaited()
+    sandbox.serialize.assert_awaited_once_with(scope="operate")
+    assert "touch /app/.nemo-gym-write-probe" in sandbox.exec.await_args_list[1].args[0]
+    assert server._session_id_to_sandbox["session"] is sandbox
+
+
+@pytest.mark.asyncio
+async def test_seed_session_rejects_non_writable_leased_workspace() -> None:
+    server = make_server(golden=False, apply_anti_cheating=False)
+    sandbox = SimpleNamespace(
+        sandbox_id="nemo-gym-box",
+        exec=AsyncMock(
+            side_effect=[
+                SimpleNamespace(return_code=0, stdout="", stderr="", error_type=None),
+                SimpleNamespace(return_code=1, stdout="", stderr="read-only", error_type=None),
+            ]
+        ),
+        upload=AsyncMock(),
+        stop=AsyncMock(),
+        serialize=AsyncMock(),
+        pty=fake_pty(),
+    )
+    server._create_sandbox = AsyncMock(return_value=sandbox)
+    request = SimpleNamespace(session={SESSION_ID_KEY: "session"})
+    body = SWEBenchProSeedSessionRequest.model_validate(
+        request_body() | {"create_pty": False, "request_sandbox_lease": True}
+    )
+
+    with pytest.raises(RuntimeError, match="not writable"):
+        await server.seed_session(request, body)
+
+    sandbox.stop.assert_awaited_once()
+    sandbox.serialize.assert_not_awaited()
+    assert "session" not in server._session_id_to_sandbox
+
+
+@pytest.mark.asyncio
+async def test_cleanup_session_is_idempotent() -> None:
+    server = make_server(golden=False)
+    session = SimpleNamespace(session_id="pty-id", close=AsyncMock())
+    sandbox = SimpleNamespace(stop=AsyncMock())
+    server._session_id_to_sandbox["session"] = sandbox
+    server._session_id_to_pty["session"] = session
+    server._session_id_to_pristine_untracked["session"] = frozenset({"artifact"})
+    request = SimpleNamespace(session={SESSION_ID_KEY: "session"})
+
+    assert await server.cleanup_session(request) == {"cleaned": True}
+    assert await server.cleanup_session(request) == {"cleaned": False}
+    session.close.assert_awaited_once()
+    sandbox.stop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_session_retains_sandbox_when_stop_fails() -> None:
+    server = make_server(golden=False)
+    sandbox = SimpleNamespace(stop=AsyncMock(side_effect=RuntimeError("temporary failure")))
+    server._session_id_to_sandbox["session"] = sandbox
+
+    assert await server.cleanup_session(SimpleNamespace(session={SESSION_ID_KEY: "session"})) == {"cleaned": True}
+    assert server._session_id_to_sandbox["session"] is sandbox
 
 
 @pytest.mark.asyncio
