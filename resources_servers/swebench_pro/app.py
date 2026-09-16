@@ -23,7 +23,7 @@ from pathlib import Path
 from shlex import quote
 from time import time
 from traceback import format_exc
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, Request
 from pydantic import BaseModel, ConfigDict
@@ -160,12 +160,22 @@ class SWEBenchProInstanceRequest(BaseModel):
 
 class SWEBenchProSeedSessionRequest(SWEBenchProInstanceRequest, BaseSeedSessionRequest):
     sandbox_spec: dict[str, Any] | None = None
+    create_pty: bool = True
+    request_sandbox_lease: bool = False
+
+
+class SWEBenchProSandboxLease(BaseModel):
+    descriptor: dict[str, Any]
+    ownership: Literal["resources"] = "resources"
 
 
 class SWEBenchProSeedSessionResponse(BaseSeedSessionResponse):
     sandbox_handle: str
-    # The agent attaches to this session; without it, it builds its own sandbox instead.
-    pty_session_id: str
+    # Interactive agents attach to this session. Exec-based agents request a
+    # sandbox lease and avoid allocating a terminal.
+    pty_session_id: str | None = None
+    sandbox_lease: SWEBenchProSandboxLease | None = None
+    cleanup_url_path: str | None = None
 
 
 class SWEBenchProVerifyRequest(SWEBenchProInstanceRequest, BaseVerifyRequest):
@@ -210,6 +220,7 @@ class SWEBenchProResourcesServer(SimpleResourcesServer):
                 await self.shutdown()
 
         app.router.lifespan_context = lifespan
+        app.post("/cleanup_session")(self.cleanup_session)
         return app
 
     async def close_pty_session(self, session: SandboxPtySession | None) -> None:
@@ -222,18 +233,29 @@ class SWEBenchProResourcesServer(SimpleResourcesServer):
             print("Failed to close SWE-bench Pro PTY session", format_exc(), file=sys.stderr)
 
     async def shutdown(self) -> None:
-        sandboxes = list(self._session_id_to_sandbox.values())
-        sessions = list(self._session_id_to_pty.values())
-        self._session_id_to_sandbox.clear()
-        self._session_id_to_pty.clear()
-        self._session_id_to_pristine_untracked.clear()
-        for session in sessions:
-            await self.close_pty_session(session)
-        for sandbox in sandboxes:
+        session_ids = set(self._session_id_to_sandbox) | set(self._session_id_to_pty)
+        for session_id in session_ids:
+            await self._cleanup_session(session_id, reason="abandoned")
+
+    async def _cleanup_session(self, session_id: str, *, reason: str) -> bool:
+        """Idempotently close one task terminal and its resources-owned sandbox."""
+        sandbox = self._session_id_to_sandbox.pop(session_id, None)
+        pty_session = self._session_id_to_pty.pop(session_id, None)
+        self._session_id_to_pristine_untracked.pop(session_id, None)
+        await self.close_pty_session(pty_session)
+        if sandbox is not None:
             try:
                 await sandbox.stop()
             except Exception:
-                print("Failed to stop abandoned SWE-bench Pro sandbox", format_exc(), file=sys.stderr)
+                # Preserve the handle so a later cleanup request or shutdown can retry.
+                self._session_id_to_sandbox[session_id] = sandbox
+                print(f"Failed to stop {reason} SWE-bench Pro sandbox", format_exc(), file=sys.stderr)
+        return sandbox is not None or pty_session is not None
+
+    async def cleanup_session(self, request: Request) -> dict[str, bool]:
+        """Release a seeded sandbox without requiring verification."""
+        session_id = request.session[SESSION_ID_KEY]
+        return {"cleaned": await self._cleanup_session(session_id, reason="released")}
 
     def _image(self, body: SWEBenchProInstanceRequest) -> str:
         if body.image_digest:
@@ -291,35 +313,54 @@ class SWEBenchProResourcesServer(SimpleResourcesServer):
         self, request: Request, body: SWEBenchProSeedSessionRequest
     ) -> SWEBenchProSeedSessionResponse:
         session_id = request.session[SESSION_ID_KEY]
-        self._session_id_to_pristine_untracked.pop(session_id, None)
-        await self.close_pty_session(self._session_id_to_pty.pop(session_id, None))
-        previous = self._session_id_to_sandbox.pop(session_id, None)
-        if previous is not None:
-            try:
-                await previous.stop()
-            except Exception:
-                print("Failed to stop previous SWE-bench Pro sandbox", format_exc(), file=sys.stderr)
+        await self._cleanup_session(session_id, reason="previous")
 
         sandbox = await self._create_sandbox(body)
-        pty_session = await sandbox.pty.create()
-        if self.config.apply_anti_cheating:
-            anti_cheat_setup_fpath = Path(__file__).parent.parent / "swebench" / "anti_cheat_setup.sh"
-            await sandbox.upload(anti_cheat_setup_fpath, "/app/anti_cheat_setup.sh")
-            result = await sandbox.exec(
-                "git reset --hard && WORKING_DIRECTORY=/app bash anti_cheat_setup.sh && rm anti_cheat_setup.sh",
-                timeout_s=600,
-            )
-            if result.return_code != 0:
-                print(
-                    f"Failed to setup anti-cheating for {body.instance_id}. Return code: {result.return_code}\n"
-                    f"Stdout:\n{result.stdout}\nStderr:\n{result.stderr}"
+        pty_session: SandboxPtySession | None = None
+        try:
+            if body.create_pty:
+                pty_session = await sandbox.pty.create()
+            if self.config.apply_anti_cheating:
+                anti_cheat_setup_fpath = Path(__file__).parent.parent / "swebench" / "anti_cheat_setup.sh"
+                await sandbox.upload(anti_cheat_setup_fpath, "/app/anti_cheat_setup.sh")
+                result = await sandbox.exec(
+                    "git reset --hard && WORKING_DIRECTORY=/app bash anti_cheat_setup.sh && rm anti_cheat_setup.sh",
+                    timeout_s=600,
                 )
-        await self.normalize_sandbox_environment(sandbox, body.instance_id)
-        self._session_id_to_pristine_untracked[session_id] = await self.pristine_untracked_files(sandbox)
+                if result.return_code != 0:
+                    print(
+                        f"Failed to setup anti-cheating for {body.instance_id}. Return code: {result.return_code}\n"
+                        f"Stdout:\n{result.stdout}\nStderr:\n{result.stderr}"
+                    )
+            await self.normalize_sandbox_environment(sandbox, body.instance_id)
+            if body.request_sandbox_lease:
+                probe = await sandbox.exec(
+                    "touch /app/.nemo-gym-write-probe && rm -f /app/.nemo-gym-write-probe",
+                    timeout_s=30,
+                )
+                if probe.return_code != 0 or probe.error_type:
+                    raise RuntimeError(
+                        f"SWE-bench Pro workspace /app is not writable: {probe.stderr or probe.error_type}"
+                    )
+            pristine_untracked = await self.pristine_untracked_files(sandbox)
+            descriptor = await sandbox.serialize(scope="operate") if body.request_sandbox_lease else None
+        except BaseException:
+            await self.close_pty_session(pty_session)
+            try:
+                await sandbox.stop()
+            except Exception:
+                print("Failed to stop unsuccessful SWE-bench Pro sandbox", format_exc(), file=sys.stderr)
+            raise
+
+        self._session_id_to_pristine_untracked[session_id] = pristine_untracked
         self._session_id_to_sandbox[session_id] = sandbox
-        self._session_id_to_pty[session_id] = pty_session
+        if pty_session is not None:
+            self._session_id_to_pty[session_id] = pty_session
         return SWEBenchProSeedSessionResponse(
-            sandbox_handle=sandbox._handle.sandbox_id, pty_session_id=pty_session.session_id
+            sandbox_handle=sandbox.sandbox_id,
+            pty_session_id=pty_session.session_id if pty_session is not None else None,
+            sandbox_lease=SWEBenchProSandboxLease(descriptor=descriptor) if descriptor is not None else None,
+            cleanup_url_path="/cleanup_session" if descriptor is not None else None,
         )
 
     async def normalize_sandbox_environment(self, sandbox: AsyncSandbox, instance_id: str) -> None:
@@ -349,9 +390,8 @@ class SWEBenchProResourcesServer(SimpleResourcesServer):
             return frozenset()
 
     async def _extract_model_patch(self, session_id: str, base_commit: str) -> str:
-        original_sandbox = self._session_id_to_sandbox.pop(session_id)
-        original_pty_session = self._session_id_to_pty.pop(session_id, None)
-        pristine_untracked = self._session_id_to_pristine_untracked.pop(session_id, frozenset())
+        original_sandbox = self._session_id_to_sandbox[session_id]
+        pristine_untracked = self._session_id_to_pristine_untracked.get(session_id, frozenset())
         try:
             result = await original_sandbox.exec(
                 f"git -C /app add -N . && git -C /app --no-pager diff {quote(base_commit)}"
@@ -360,11 +400,7 @@ class SWEBenchProResourcesServer(SimpleResourcesServer):
                 raise RuntimeError(result.stderr or "git diff failed")
             return drop_patch_sections(result.stdout or "", pristine_untracked)
         finally:
-            await self.close_pty_session(original_pty_session)
-            try:
-                await original_sandbox.stop()
-            except Exception:
-                print("Failed to stop agent sandbox", format_exc(), file=sys.stderr)
+            await self._cleanup_session(session_id, reason="agent")
 
     async def verify(self, request: Request, body: SWEBenchProVerifyRequest) -> SWEBenchProVerifyResponse:
         session_id = request.session[SESSION_ID_KEY]
