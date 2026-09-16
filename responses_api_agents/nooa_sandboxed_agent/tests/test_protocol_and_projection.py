@@ -2,7 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import importlib
+import json
 import sys
+from pathlib import Path
+
+from pydantic import BaseModel
 
 from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
 from nemo_gym.rollout_observability import SandboxObservation
@@ -13,6 +17,11 @@ from responses_api_agents.nooa_sandboxed_agent.protocol import (
     NOOASandboxResult,
     NOOAToolArtifact,
 )
+from responses_api_agents.nooa_sandboxed_agent.sandbox_runner import ArtifactRecorder
+
+
+class StructuredToolArgument(BaseModel):
+    value: str
 
 
 def test_host_can_import_runner_without_importing_nooa() -> None:
@@ -23,6 +32,21 @@ def test_host_can_import_runner_without_importing_nooa() -> None:
 
     assert "nooa" not in imported
     assert not any(name.startswith("nooa.") for name in imported)
+
+
+def test_recorder_serializes_structured_tool_arguments(tmp_path: Path) -> None:
+    recorder = ArtifactRecorder(tmp_path)
+    context = recorder._before_execution(
+        "nooa_tool",
+        "tool-1",
+        "return_result",
+        {"result": StructuredToolArgument(value="done")},
+    )
+
+    recorder._after_execution(context, StructuredToolArgument(value="done"), None)
+
+    assert recorder.tool_calls[0]["arguments"] == {"result": {"value": "done"}}
+    assert json.loads(json.dumps(recorder.tool_calls))[0]["output"] == {"value": "done"}
 
 
 def test_projection_preserves_model_and_resource_tool_evidence() -> None:

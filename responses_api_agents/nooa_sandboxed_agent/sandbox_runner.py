@@ -184,7 +184,7 @@ class ArtifactRecorder:
             "kind": kind,
             "execution_id": execution_id,
             "name": name,
-            "arguments": arguments,
+            "arguments": _artifact_value(arguments),
             "invocation_id": self.current_invocation.get(),
             "started_at": time.time(),
             "started_monotonic": time.perf_counter(),
