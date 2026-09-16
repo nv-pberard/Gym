@@ -374,7 +374,10 @@ async def test_execute_uses_workdir_unique_root_and_persists_failure_artifacts(t
 
     runner_call = sandbox.exec.call_args_list[3]
     assert runner_call.kwargs["cwd"] == "/app"
-    assert runner_call.args[0].startswith("/opt/nooa/bin/python /tmp/nemo-gym-nooa-")
+    assert "exec /opt/nooa/bin/python /tmp/nemo-gym-nooa-" in runner_call.args[0]
+    assert "HOME" not in runner_call.kwargs["env"]
+    assert runner_call.kwargs["env"]["PYTHONPATH"].startswith("/tmp/nemo-gym-nooa-")
+    assert sandbox.upload.call_args_list[1].args[1].endswith("/gym_nooa_bench_agent.py")
     assert execution.result.status == "failed"
     assert execution.artifacts_path is not None
     artifacts = Path(execution.artifacts_path)

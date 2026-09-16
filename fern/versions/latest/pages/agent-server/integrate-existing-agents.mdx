@@ -8,38 +8,6 @@ You can use an existing agent in NeMo Gym, integrate an external one, or build y
 
 [`SimpleAgent`](https://github.com/NVIDIA-NeMo/Gym/tree/main/responses_api_agents/simple_agent) is a native NeMo Gym agent that handles general-purpose multi-step tool calling with configurable max steps, and works with any Resources server out of the box. NeMo Gym also includes agents that integrate external tools: for example, [`MiniSWEAgent`](https://github.com/NVIDIA-NeMo/Gym/tree/main/responses_api_agents/mini_swe_agent) wraps an external coding harness running in Docker containers and converts its output back into the NeMo Gym format, and [`claude_code_agent`](https://github.com/NVIDIA-NeMo/Gym/tree/main/responses_api_agents/claude_code_agent) runs the Claude Code CLI. Because every Gym model server speaks Anthropic Messages, you can point Claude Code at any backend — see [Anthropic Messages](/model-server/anthropic-messages).
 
-## Run a NOOA Agent in a Sandbox
-
-Use `nooa_sandboxed_agent` when a [NOOA](https://github.com/NVIDIA-NeMo/labs-OO-Agents) agent can execute generated Python or should otherwise be isolated from the Agent server process. The host process only orchestrates lifecycle and verification. It uploads a request and runner, and all NOOA imports, generated code, model calls, and resource-tool calls happen in the task sandbox.
-
-Start from `responses_api_agents/nooa_sandboxed_agent/configs/nooa_sandboxed_agent.yaml` and configure:
-
-- `sandbox_spec.image`: an image that contains NOOA and its dependencies. With `runtime.source: baked`, the default executable is `/opt/nooa/bin/python`.
-- `sandbox_provider`: the named `sandbox` block from a provider config. Include one of the configs under `nemo_gym/sandbox/providers/*/configs/` when starting the environment.
-- `agent.agent_class`: the sandbox import path in `module.path:ClassName` form.
-- `agent.entrypoint`: an async method on that class.
-- `agent.arguments`: explicit mappings from the Gym row to the entrypoint parameters. Mappings cannot read verifier or Gym-internal result fields.
-- `agent.allowed_tools`: resource-tool names that may appear on `self.<tool_namespace>`. The Resources server must enable `expose_tools_over_mcp` so `/seed_session` can issue a rollout-scoped signed MCP token.
-- `sandbox_model_base_url` and `sandbox_resources_base_url`: sandbox-reachable overrides when the provider cannot route to Gym's configured server hostnames. Use `sandbox_model_base_urls` for per-server overrides, including servers referenced by `agent.model_aliases`.
-
-Build the reference baked runtime before using the default `/opt/nooa/bin/python` path:
-
-```bash
-docker build \
-  -t nemo-gym-nooa:latest \
-  responses_api_agents/nooa_sandboxed_agent
-```
-
-Set `sandbox_spec.image: nemo-gym-nooa:latest`, then provide the agent module in the task image or package it as a `tar.gz` archive through `agent.source_archive`. A model alias key becomes a hidden LLM-client attribute on the agent, so a method can select it with NOOA's callable strategy override, such as `@strategy(llm=lambda self: self.reviewer_llm)`.
-
-For Docker Engine on Linux, make `host.docker.internal` available to the sandbox by adding `--add-host=host.docker.internal:host-gateway` to the Docker provider's `create.extra_run_args`. Docker Desktop provides this hostname automatically.
-
-The runner sends every model request through the configured Gym Model server and shares one `max_model_calls` budget across the root agent, nested agents, and configured model aliases. It emits a versioned result artifact that the host projects into the Responses API output, `ng_agent_observations`, and `ng_trajectory` before calling the Resources server verifier.
-
-<Warning>
-NOOA does not itself provide the operating-system security boundary. Use a remote sandbox provider or a Docker-backed sandbox with an appropriate image and resource limits. `runtime.source: archive` uploads executable code into each sandbox and is intended for controlled development; prefer a baked, immutable runtime for production evaluations.
-</Warning>
-
 ## Tools in Agent vs. Resources Server
 
 Existing agents may come with predefined tools, allowing you to leverage them directly and use the Resources server to supplement with any additional external tools. When building a new environment, prefer defining tools in the Resources server rather than the Agent server. This separation of concerns allows different agents to share the same Resources server without duplicating tool logic.

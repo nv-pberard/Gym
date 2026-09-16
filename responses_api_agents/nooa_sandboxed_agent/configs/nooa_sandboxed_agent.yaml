@@ -43,12 +43,18 @@ nooa_sandboxed_agent:
       # use an interactive terminal, so compatible Resources servers can skip it.
       seed_session_overrides:
         create_pty: false
+        request_sandbox_lease: true
 
       runtime:
         # "baked" expects the image to contain NOOA at /opt/nooa/bin/python.
         # "archive" uploads and extracts a portable virtual environment per sandbox.
+        # "auto" builds and caches that archive from the pinned runtime requirements.
         source: baked
         archive_path: null
+        cache_dir: .runtime
+        python_version: 3.13.14
+        python_build_standalone_release: "20260805"
+        architecture: x86_64-unknown-linux-gnu
         python: /opt/nooa/bin/python
         extract_dir: /tmp/nemo-gym-nooa-runtime
         # Null preserves the sandbox provider's configured working directory.

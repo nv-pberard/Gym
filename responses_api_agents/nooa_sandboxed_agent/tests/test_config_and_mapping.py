@@ -73,6 +73,9 @@ def test_agent_spec_rejects_unsafe_names_and_reserved_llm() -> None:
 def test_archive_runtime_requires_archive_path() -> None:
     with pytest.raises(ValidationError, match="archive_path is required"):
         NOOARuntimeConfig(source="archive")
+    assert NOOARuntimeConfig(source="auto").archive_path is None
+    with pytest.raises(ValidationError, match="only valid"):
+        NOOARuntimeConfig(source="auto", archive_path="runtime.tar.gz")
 
 
 def test_runtime_workdir_must_be_an_absolute_non_root_path() -> None:

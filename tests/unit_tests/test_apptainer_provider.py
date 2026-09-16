@@ -21,6 +21,7 @@ from typing import Any, Callable
 
 import pytest
 
+from nemo_gym.sandbox import ConnectableProvider
 from nemo_gym.sandbox.providers.apptainer import provider as apptainer_provider
 from nemo_gym.sandbox.providers.base import (
     SandboxExecResult,
@@ -247,6 +248,10 @@ def test_constructor_requires_binary(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(apptainer_provider.shutil, "which", lambda _name: None)
     with pytest.raises(RuntimeError):
         apptainer_provider.ApptainerProvider()
+
+
+def test_apptainer_provider_is_connectable(fake_binary: str) -> None:
+    assert isinstance(apptainer_provider.ApptainerProvider(), ConnectableProvider)
 
 
 # --------------------------------------------------------------------------- #
@@ -755,6 +760,112 @@ async def test_status_unknown_paths(fake_binary: str, monkeypatch: pytest.Monkey
 
     provider, _rec = _make_provider(monkeypatch, timeout_responder)
     assert await provider.status(handle) is SandboxStatus.UNKNOWN
+
+
+# --------------------------------------------------------------------------- #
+# serialize / connect
+# --------------------------------------------------------------------------- #
+async def test_serialize_handle_captures_node_local_instance_state(
+    fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    provider, _rec = _make_provider(monkeypatch, lambda argv: (0, "", ""))
+    handle = _make_handle(tmp_path, env={"TOKEN": "value"})
+
+    assert await provider.serialize_handle(handle, scope="operate") == {
+        "version": apptainer_provider.HANDLE_DESCRIPTOR_VERSION,
+        "provider": "apptainer",
+        "sandbox_id": "nemo-gym-x",
+        "staging_dir": str(tmp_path),
+        "mount_point": "/sandbox",
+        "image": "docker://img",
+        "env": {"TOKEN": "value"},
+    }
+
+
+async def test_serialize_handle_rejects_mismatched_identity(
+    fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    provider, _rec = _make_provider(monkeypatch, lambda argv: (0, "", ""))
+    handle = _make_handle(tmp_path)
+    handle.sandbox_id = "nemo-gym-other"
+
+    with pytest.raises(ValueError, match="identity"):
+        await provider.serialize_handle(handle)
+
+
+async def test_connect_rebuilds_running_handle(
+    fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    out = json.dumps({"instances": [{"instance": "nemo-gym-x"}]})
+    provider, rec = _make_provider(monkeypatch, lambda argv: (0, out, ""))
+    descriptor = {
+        "version": apptainer_provider.HANDLE_DESCRIPTOR_VERSION,
+        "provider": "apptainer",
+        "sandbox_id": "nemo-gym-x",
+        "staging_dir": str(tmp_path),
+        "mount_point": "/sandbox",
+        "image": "docker://img",
+        "env": {"TOKEN": "value"},
+        "workdir": "/app",
+    }
+
+    handle = await provider.connect(descriptor)
+
+    assert handle.sandbox_id == "nemo-gym-x"
+    assert handle.provider_name == "apptainer"
+    assert handle.raw == apptainer_provider._ApptainerInstance(
+        name="nemo-gym-x",
+        staging_dir=tmp_path,
+        mount_point="/sandbox",
+        image="docker://img",
+        env={"TOKEN": "value"},
+    )
+    assert rec.calls[0]["argv"] == [FAKE_BINARY, "instance", "list", "--json"]
+
+
+@pytest.mark.parametrize(
+    ("update", "error"),
+    [
+        ({"version": 999}, "version"),
+        ({"provider": "docker"}, "provider"),
+        ({"sandbox_id": "foreign-instance"}, "sandbox_id"),
+        ({"staging_dir": "relative"}, "staging_dir"),
+        ({"mount_point": "/"}, "mount_point"),
+        ({"image": ""}, "image"),
+        ({"env": {"HOME": "/tmp/home"}}, "invalid env"),
+    ],
+)
+async def test_connect_rejects_invalid_descriptor(
+    fake_binary: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    update: dict[str, Any],
+    error: str,
+) -> None:
+    provider, _rec = _make_provider(monkeypatch, lambda argv: (0, "", ""))
+    descriptor = {
+        "version": apptainer_provider.HANDLE_DESCRIPTOR_VERSION,
+        "provider": "apptainer",
+        "sandbox_id": "nemo-gym-x",
+        "staging_dir": str(tmp_path),
+        "mount_point": "/sandbox",
+        "image": "docker://img",
+        "env": {},
+        **update,
+    }
+
+    with pytest.raises(ValueError, match=error):
+        await provider.connect(descriptor)
+
+
+async def test_connect_rejects_stale_instance(
+    fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    provider, _rec = _make_provider(monkeypatch, lambda argv: (0, json.dumps({"instances": []}), ""))
+    descriptor = await provider.serialize_handle(_make_handle(tmp_path))
+
+    with pytest.raises(RuntimeError, match="not running"):
+        await provider.connect(descriptor)
 
 
 # --------------------------------------------------------------------------- #

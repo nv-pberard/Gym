@@ -12,7 +12,7 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import Body, Request, Response
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, PrivateAttr
 
 from nemo_gym.base_resources_server import (
     NEMO_GYM_MCP_METADATA_KEY,
@@ -49,6 +49,7 @@ from responses_api_agents.nooa_sandboxed_agent.runtime import (
     execute_in_sandbox,
     release_sandbox,
 )
+from responses_api_agents.nooa_sandboxed_agent.runtime_builder import prepare_runtime_archive
 
 
 LOG = logging.getLogger(__name__)
@@ -139,10 +140,13 @@ class NOOASandboxedAgent(SimpleResponsesAPIAgent):
     """Provider-neutral host orchestrator; it deliberately never imports NOOA."""
 
     config: NOOASandboxedAgentConfig
+    _runtime_archive_path: str | None = PrivateAttr(default=None)
 
     def model_post_init(self, context: Any, /) -> None:
         super().model_post_init(context)
         self._semaphore = asyncio.Semaphore(self.config.concurrency)
+        if self.config.runtime.source == "auto":
+            self._runtime_archive_path = str(prepare_runtime_archive(self.config.runtime))
 
     def _server_base_url(self, server_name: str) -> str:
         server_config = get_first_server_config_dict(self.server_client.global_config_dict, server_name)
@@ -288,6 +292,7 @@ class NOOASandboxedAgent(SimpleResponsesAPIAgent):
                 acquired,
                 self._sandbox_request(body, seed_json, rollout_id=rollout_id, task_id=task_id),
                 self.config,
+                runtime_archive_path=self._runtime_archive_path,
             )
             sandbox_observation = SandboxObservation(
                 role="agent",

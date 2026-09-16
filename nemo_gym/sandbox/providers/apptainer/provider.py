@@ -48,6 +48,7 @@ LOGGER = logging.getLogger(__name__)
 
 DEFAULT_MOUNT_POINT = "/sandbox"
 INSTANCE_NAME_PREFIX = "nemo-gym-"
+HANDLE_DESCRIPTOR_VERSION = 1
 READY_PROBE_COMMAND = "printf apptainer-sandbox-ready"
 READY_PROBE_EXPECTED = "apptainer-sandbox-ready"
 SANDBOX_RUNTIME_RETURN_CODE = 125
@@ -711,6 +712,78 @@ class ApptainerProvider:
 
         # Not listed -> it has been stopped (or never existed anymore).
         return SandboxStatus.STOPPED
+
+    async def serialize_handle(self, handle: SandboxHandle, *, scope: str | None = None) -> dict[str, Any]:
+        """Serialize a node-local instance handle for another Gym process.
+
+        Apptainer instances and their staging directories are owned by the
+        launching OS user on one host. The descriptor is therefore intentionally
+        node-local: consumers must run on the same host as the resources server.
+        """
+        del scope
+        inst = handle.raw
+        if not isinstance(inst, _ApptainerInstance):
+            raise TypeError("Apptainer handle contains invalid provider state")
+        if handle.provider_name != self.name or handle.sandbox_id != inst.name:
+            raise ValueError("Apptainer handle identity does not match its provider state")
+        return {
+            "version": HANDLE_DESCRIPTOR_VERSION,
+            "provider": self.name,
+            "sandbox_id": handle.sandbox_id,
+            "staging_dir": str(inst.staging_dir),
+            "mount_point": inst.mount_point,
+            "image": inst.image,
+            "env": dict(inst.env),
+        }
+
+    async def connect(self, descriptor: Mapping[str, Any]) -> SandboxHandle:
+        """Reconnect to a live, node-local Apptainer instance."""
+        if not isinstance(descriptor, Mapping):
+            raise TypeError("Apptainer sandbox descriptor must be a mapping")
+        if descriptor.get("version") != HANDLE_DESCRIPTOR_VERSION:
+            raise ValueError(f"Unsupported Apptainer sandbox descriptor version: {descriptor.get('version')!r}")
+        if descriptor.get("provider") != self.name:
+            raise ValueError(f"Apptainer sandbox descriptor provider must be {self.name!r}")
+
+        name = descriptor.get("sandbox_id")
+        staging_dir_value = descriptor.get("staging_dir")
+        mount_point = descriptor.get("mount_point")
+        image = descriptor.get("image")
+        env = descriptor.get("env", {})
+        if not isinstance(name, str) or not name.startswith(INSTANCE_NAME_PREFIX):
+            raise ValueError("Apptainer sandbox descriptor has an invalid sandbox_id")
+        if not isinstance(staging_dir_value, str):
+            raise ValueError("Apptainer sandbox descriptor staging_dir must be a string")
+        staging_dir = Path(staging_dir_value)
+        if not staging_dir.is_absolute() or not staging_dir.is_dir():
+            raise ValueError("Apptainer sandbox descriptor staging_dir must be an existing absolute directory")
+        if not isinstance(mount_point, str) or not mount_point.startswith("/") or mount_point == "/":
+            raise ValueError("Apptainer sandbox descriptor mount_point must be an absolute, non-root path")
+        if not isinstance(image, str) or not image:
+            raise ValueError("Apptainer sandbox descriptor image must be a non-empty string")
+        if not isinstance(env, Mapping):
+            raise ValueError("Apptainer sandbox descriptor env must be a mapping")
+        try:
+            normalized_env = {str(key): value for key, value in env.items()}
+            _serialize_env_file(normalized_env)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"Apptainer sandbox descriptor has invalid env: {e}") from e
+
+        handle = SandboxHandle(
+            sandbox_id=name,
+            provider_name=self.name,
+            raw=_ApptainerInstance(
+                name=name,
+                staging_dir=staging_dir,
+                mount_point=mount_point,
+                image=image,
+                env=normalized_env,
+            ),
+        )
+        status = await self.status(handle)
+        if status is not SandboxStatus.RUNNING:
+            raise RuntimeError(f"Apptainer sandbox {name!r} is not running (status={status.value})")
+        return handle
 
     async def close(self, handle: SandboxHandle) -> None:
         """Stop the instance and clean up the host staging dir.

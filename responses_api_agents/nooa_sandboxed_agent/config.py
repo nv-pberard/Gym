@@ -105,8 +105,12 @@ class NOOAAgentSpec(BaseModel):
 class NOOARuntimeConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    source: Literal["baked", "archive"] = "baked"
+    source: Literal["auto", "baked", "archive"] = "baked"
     archive_path: str | None = None
+    cache_dir: str = ".runtime"
+    python_version: str = "3.13.14"
+    python_build_standalone_release: str = "20260805"
+    architecture: str = "x86_64-unknown-linux-gnu"
     python: str = "/opt/nooa/bin/python"
     extract_dir: str = "/tmp/nemo-gym-nooa-runtime"
     workdir: str | None = None
@@ -128,11 +132,18 @@ class NOOARuntimeConfig(BaseModel):
             raise ValueError("runtime.expected_nooa_version must be non-empty or null")
         return value
 
+    @field_validator("cache_dir", "python_version", "python_build_standalone_release", "architecture")
+    @classmethod
+    def validate_non_empty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("portable runtime settings must be non-empty")
+        return value
+
     @model_validator(mode="after")
     def validate_source(self) -> "NOOARuntimeConfig":
         if self.source == "archive" and not self.archive_path:
             raise ValueError("runtime.archive_path is required when runtime.source=archive")
-        if self.source == "baked" and self.archive_path is not None:
+        if self.source != "archive" and self.archive_path is not None:
             raise ValueError("runtime.archive_path is only valid when runtime.source=archive")
         return self
 
@@ -145,7 +156,9 @@ class NOOASandboxedAgentConfig(BaseResponsesAPIAgentConfig):
     sandbox_model_base_url: str | None = None
     sandbox_model_base_urls: dict[str, str] = Field(default_factory=dict)
     sandbox_resources_base_url: str | None = None
-    seed_session_overrides: dict[str, Any] = Field(default_factory=lambda: {"create_pty": False})
+    seed_session_overrides: dict[str, Any] = Field(
+        default_factory=lambda: {"create_pty": False, "request_sandbox_lease": True}
+    )
     runtime: NOOARuntimeConfig = Field(default_factory=NOOARuntimeConfig)
     agent: NOOAAgentSpec
     max_model_calls: int = Field(default=10, gt=0)

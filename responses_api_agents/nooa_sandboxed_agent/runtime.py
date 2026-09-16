@@ -154,17 +154,21 @@ async def execute_in_sandbox(
     acquired: AcquiredSandbox,
     request: NOOASandboxRequest,
     config: NOOASandboxedAgentConfig,
+    *,
+    runtime_archive_path: str | None = None,
 ) -> SandboxExecution:
     sandbox = acquired.sandbox
     run_id = uuid4().hex
     remote_root = f"{REMOTE_ROOT_PREFIX}{run_id}"
     remote_request = f"{remote_root}/request.json"
     remote_runner = f"{remote_root}/sandbox_runner.py"
+    remote_bench_adapter = f"{remote_root}/gym_nooa_bench_agent.py"
     remote_artifacts = f"{remote_root}/artifacts"
     remote_agent_source = f"{remote_root}/agent-source"
     runtime_extract_dir = f"{config.runtime.extract_dir}-{run_id}"
     request = request.model_copy(update={"artifacts_dir": remote_artifacts})
     runner_path = Path(__file__).with_name("sandbox_runner.py")
+    bench_adapter_path = Path(__file__).with_name("gym_nooa_bench_agent.py")
     local_artifacts = Path(config.results_dir).expanduser().resolve() / run_id if config.results_dir else None
     if local_artifacts is not None:
         local_artifacts.mkdir(parents=True, exist_ok=False)
@@ -178,18 +182,21 @@ async def execute_in_sandbox(
         if prepare.return_code != 0 or prepare.error_type:
             raise RuntimeError(f"failed to prepare sandbox runner directory: {(prepare.stderr or '')[:1000]}")
         await sandbox.upload(runner_path, remote_runner)
+        await sandbox.upload(bench_adapter_path, remote_bench_adapter)
 
         python = config.runtime.python
-        if config.runtime.source == "archive":
-            assert config.runtime.archive_path is not None
+        if config.runtime.source in {"auto", "archive"}:
+            archive_path = config.runtime.archive_path if config.runtime.source == "archive" else runtime_archive_path
+            if archive_path is None:
+                raise RuntimeError("runtime.source=auto requires a prepared runtime archive")
             await _stage_archive(
                 sandbox,
-                config.runtime.archive_path,
+                archive_path,
                 "runtime.tar.gz",
                 runtime_extract_dir,
                 remote_root=remote_root,
             )
-            python = f"{runtime_extract_dir}/bin/python"
+            python = f"{runtime_extract_dir}/bin/python3"
         if config.agent.source_archive:
             await _stage_archive(
                 sandbox,
@@ -203,17 +210,18 @@ async def execute_in_sandbox(
         if check.return_code != 0:
             raise RuntimeError(f"sandbox NOOA Python is not executable: {python}")
 
-        pythonpath = (
-            [remote_agent_source, *config.agent.pythonpath] if config.agent.source_archive else config.agent.pythonpath
-        )
+        pythonpath = [remote_root]
+        if config.agent.source_archive:
+            pythonpath.append(remote_agent_source)
+        pythonpath.extend(config.agent.pythonpath)
+        home = f"{remote_root}/home"
+        tmpdir = f"{remote_root}/tmp"
         env = {
             "NOOA_SANDBOX_REQUEST": remote_request,
             "PYTHONPATH": ":".join(pythonpath),
-            "HOME": f"{remote_root}/home",
-            "TMPDIR": f"{remote_root}/tmp",
         }
         prepare_home = await sandbox.exec(
-            f"mkdir -p {shlex.quote(env['HOME'])} {shlex.quote(env['TMPDIR'])}",
+            f"mkdir -p {shlex.quote(home)} {shlex.quote(tmpdir)}",
             timeout_s=30,
         )
         if prepare_home.return_code != 0 or prepare_home.error_type:
@@ -222,8 +230,12 @@ async def execute_in_sandbox(
         # The runner unlinks it immediately after parsing.
         await sandbox.upload(local_request, remote_request)
         started = time.perf_counter()
+        command = (
+            f"export HOME={shlex.quote(home)} TMPDIR={shlex.quote(tmpdir)}; "
+            f"exec {shlex.quote(python)} {shlex.quote(remote_runner)}"
+        )
         execution = await sandbox.exec(
-            f"{shlex.quote(python)} {shlex.quote(remote_runner)}",
+            command,
             cwd=config.runtime.workdir,
             env=env,
             timeout_s=config.timeout_s,
@@ -279,7 +291,7 @@ async def execute_in_sandbox(
         finally:
             try:
                 cleanup_paths = [remote_root]
-                if config.runtime.source == "archive":
+                if config.runtime.source in {"auto", "archive"}:
                     cleanup_paths.append(runtime_extract_dir)
                 quoted_paths = " ".join(shlex.quote(path) for path in cleanup_paths)
                 await sandbox.exec(f"rm -rf {quoted_paths}", timeout_s=30)
